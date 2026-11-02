@@ -1,10 +1,10 @@
 {
   "name": "keepwarm",
-  "description": "Keeps an idle session's prompt cache warm so the next message you type reads from cache instead of paying a full cache write.",
-  "version": "0.5.0",
+  "description": "主会话与子代理缓存保活；会话切换恢复；90%额度保护；多账户独立每日唤醒。",
+  "version": "0.9.3",
   "author": {
     "name": "Gabriel (delitefully)",
     "email": "git@delite.dev"
   },
-  "homepage": "https://github.com/Delitefully/claude-keepwarm"
+  "homepage": "https://github.com/Molun0301/claude-keepwarm"
 }

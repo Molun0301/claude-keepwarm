@@ -1,3 +1,14 @@
-.claude/types/
-assets/candidates/
+/docs/开发文档/
+/work/
+/dist/
+/node_modules/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+*.log
+*.jsonl
+/page/snapshot.js
+*.tmp
 .DS_Store

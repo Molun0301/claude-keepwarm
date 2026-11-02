@@ -1,0 +1,158 @@
+[
+  {
+    "agentId": "fixture-agent-1",
+    "marker": "KWfixture11",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture11] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture11，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture11] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture11，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "upstream_429"
+  },
+  {
+    "agentId": "fixture-agent-1",
+    "marker": "KWfixture12",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture12] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture12，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture12] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture12，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "upstream_429"
+  },
+  {
+    "agentId": "fixture-agent-2",
+    "marker": "KWfixture1",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture1] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture1，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture1] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture1，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "upstream_429"
+  },
+  {
+    "agentId": "fixture-agent-2",
+    "marker": "KWfixture2",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture2] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture2，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture2] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture2，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "upstream_429"
+  },
+  {
+    "agentId": "fixture-agent-2",
+    "marker": "KWfixture3",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture3] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture3，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture3] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture3，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "upstream_429"
+  },
+  {
+    "agentId": "fixture-agent-2",
+    "marker": "KWfixture4",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture4] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture4，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture4] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture4，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "upstream_429"
+  },
+  {
+    "agentId": "fixture-agent-2",
+    "marker": "KWfixture5",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture5] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture5，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture5] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture5，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "upstream_429"
+  },
+  {
+    "agentId": "fixture-agent-2",
+    "marker": "KWfixture6",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture6] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture6，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture6] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture6，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "upstream_429"
+  },
+  {
+    "agentId": "fixture-agent-2",
+    "marker": "KWfixture7",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture7] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture7，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture7] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture7，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "upstream_429"
+  },
+  {
+    "agentId": "fixture-agent-2",
+    "marker": "KWfixture8",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture8] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture8，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture8] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture8，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "upstream_429"
+  },
+  {
+    "agentId": "fixture-agent-2",
+    "marker": "KWfixture9",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture9] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture9，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture9] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture9，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "upstream_429"
+  },
+  {
+    "agentId": "fixture-agent-2",
+    "marker": "KWfixture10",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture10] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture10，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture10] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture10，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "upstream_429"
+  },
+  {
+    "agentId": "fixture-agent-3",
+    "marker": "KWfixture23",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture23] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture23，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture23] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture23，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "local_quota_block"
+  },
+  {
+    "agentId": "fixture-agent-3",
+    "marker": "KWfixture24",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture24] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture24，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture24] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture24，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "local_quota_block"
+  },
+  {
+    "agentId": "fixture-agent-3",
+    "marker": "KWfixture25",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture25] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture25，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture25] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture25，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "local_quota_block"
+  },
+  {
+    "agentId": "fixture-agent-3",
+    "marker": "KWfixture26",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture26] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture26，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture26] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture26，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "local_quota_block"
+  },
+  {
+    "agentId": "fixture-agent-4",
+    "marker": "KWfixture13",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture13] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture13，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture13] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture13，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "local_quota_block"
+  },
+  {
+    "agentId": "fixture-agent-4",
+    "marker": "KWfixture14",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture14] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture14，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture14] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture14，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "local_quota_block"
+  },
+  {
+    "agentId": "fixture-agent-4",
+    "marker": "KWfixture15",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture15] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture15，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture15] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture15，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "local_quota_block"
+  },
+  {
+    "agentId": "fixture-agent-4",
+    "marker": "KWfixture16",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture16] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture16，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture16] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture16，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "local_quota_block"
+  },
+  {
+    "agentId": "fixture-agent-4",
+    "marker": "KWfixture17",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture17] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture17，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture17] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture17，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "local_quota_block"
+  },
+  {
+    "agentId": "fixture-agent-4",
+    "marker": "KWfixture18",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture18] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture18，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture18] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture18，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "local_quota_block"
+  },
+  {
+    "agentId": "fixture-agent-4",
+    "marker": "KWfixture19",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture19] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture19，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture19] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture19，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "local_quota_block"
+  },
+  {
+    "agentId": "fixture-agent-4",
+    "marker": "KWfixture20",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture20] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture20，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture20] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture20，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "local_quota_block"
+  },
+  {
+    "agentId": "fixture-agent-4",
+    "marker": "KWfixture21",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture21] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture21，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture21] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture21，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "local_quota_block"
+  },
+  {
+    "agentId": "fixture-agent-4",
+    "marker": "KWfixture22",
+    "text": "<teammate-message teammate_id=\"team-lead\" summary=\"[keepwarm:KWfixture22] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture22，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\">\n[keepwarm:KWfixture22] 这条消息仅用于刷新当前对话缓存。只回复 KWfixture22，不要调用工具、继续旧任务、创建代理或向其他会话发消息。\n</teammate-message>",
+    "priorResult": "local_quota_block"
+  }
+]

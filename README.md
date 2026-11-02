@@ -1,222 +1,90 @@
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/logo-lockup-dark.png">
-  <img src="assets/logo-lockup.png" alt="keepwarm" width="420">
-</picture>
+# keepwarm 保活派生版
 
-Two Claude Code plugins that keep an idle session's prompt cache warm, so the
-next message you type reads the conversation from cache instead of paying to
-write it again, and leave nothing on screen while they do it.
+基于 [Delitefully/claude-keepwarm](https://github.com/Delitefully/claude-keepwarm) 的个人维护版本。保留主会话缓存保活，并加入子代理独立保活、会话切换恢复、计数与日志、可选额度保护和每日定时唤醒。
 
-Claude Code re-sends the whole conversation every turn, and the API caches it by
-prefix. On a Claude subscription inside plan usage, the main conversation's cache
-TTL is 1 hour; otherwise it is 5 minutes. Any request that hits the cache resets
-the timer. Idle past the TTL and your next message pays a cache write instead of
-a cache read: a 1h cache write bills at 2x base input, a cache read at about
-0.1x.
+当前版本 `0.9.3`。插件需要支持功能钩子的 Claude Code；本次清单验证使用 2.1.316，历史功能验证基于 2.1.312。辅助脚本需要 Node.js 18+，离线测试需要 Node.js 24+，配置助手需要 Python 3.10+。每日定时唤醒仅支持具备 systemd（系统服务管理器）用户服务的 Linux。
 
-keepwarm spends one read to avoid one write. After the session has been idle for
-`KEEPWARM_INTERVAL_MIN` (default 45) it re-sends the main thread's last request
-with one line after it asking for a single period (`$.model.fork`). That request
-re-reads the cached prefix and resets the TTL, and it is not a turn: nothing is
-added to the transcript, so nothing shows on screen and the model never sees it.
-Measured in a real terminal session: the keepalive read 53,922 tokens from
-cache, wrote 0, and produced 3 output tokens. With the TTL forced to 5m to see
-it expire in minutes, a bump at 4m03s read 54,049 tokens and wrote 0, and a real
-turn at 8m34s, past the TTL, still read 54,049 and wrote 37.
+保活会发送真实模型请求并消耗用量。实际缓存效果取决于模型、服务端缓存策略和间隔设置；不保证降低费用或订阅用量。
 
-## Install
+## 安装
 
-    claude plugin marketplace add Delitefully/claude-keepwarm
-    claude plugin install keepwarm@keepwarm
+```bash
+git clone https://github.com/Molun0301/claude-keepwarm.git
+cd claude-keepwarm
+claude plugin marketplace add Molun0301/claude-keepwarm
+claude plugin install keepwarm@keepwarm
+python3 scripts/configure.py enable
+```
 
-It needs function hooks. Add this to `~/.claude/settings.json`:
+配置助手只合并 `env.CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`，支持 `--config-dir` 或 `CLAUDE_CONFIG_DIR`。重新打开 Claude 或执行 `/reload-plugins`。
 
-    { "env": { "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1" } }
+如果已有同名 `keepwarm` 市场，先查看 `claude plugin marketplace list`。上游版和本派生版使用相同插件标识，不能同时注册为两个不同版本。迁移时先 `/keepwarm wake off` 关闭已配置的定时任务，再执行：
 
-To pause it in one session: `/keepwarm pause`, and `/keepwarm resume` to turn it
-back on. Kill switch for every session at once: `touch ~/.claude/keepwarm-off`.
-To stop loading it: `claude plugin disable keepwarm@keepwarm`.
+```bash
+claude plugin uninstall keepwarm@keepwarm
+claude plugin marketplace remove keepwarm
+claude plugin marketplace add Molun0301/claude-keepwarm
+claude plugin install keepwarm@keepwarm
+```
 
-Earlier versions said to install `keepwarm-bundle`, which pulled in `keepwarm`
-and `keepwarm-quiet`, a second plugin that blanked the rows a bump left. Since
-0.5 a bump leaves none, so `keepwarm-quiet` is gone and the bundle now pulls in
-`keepwarm` alone; an existing bundle install keeps working. The copy of
-`keepwarm-quiet` it installed stays until you remove it:
-`claude plugin uninstall keepwarm-quiet@keepwarm`.
+手工维护的 `~/.claude/keepwarm` 状态保留。旧会话重载插件。恢复原有每日唤醒时间需重新执行 `/keepwarm wake HH:MM`。
 
-### If you cannot turn function hooks on
+## 使用与配置
 
-`keepwarm-shell` does the same job with a background monitor on a sleep loop, and
-needs no flag:
+- `/keepwarm`：查看总数、本轮次数、每路状态和日志位置。
+- `/keepwarm pause` / `/keepwarm resume`：暂停或恢复当前会话的插件行为。
+- `touch ~/.claude/keepwarm-off`：全局关闭；删除此文件后恢复。
+- `/keepwarm wake 07:00`：每天本机时间新建最简会话唤醒。
+- `/keepwarm wake` / `/keepwarm wake off`：查看或关闭日程。
 
-    claude plugin install keepwarm-shell@keepwarm
+配置放在 Claude `settings.json` 的 `env` 中，或由启动环境传入：
 
-It is a separate plugin because a monitor is a process that lives as long as the
-session, so Claude Code counts it in the footer and lists it when you quit under
-"Background work is running". The mod needs no process, so a session running
-`keepwarm` shows nothing at all. Install one or the other. With both installed
-and function hooks on, the monitor stands down and lets the mod drive.
+| 配置 | 默认值 | 用途 |
+|---|---:|---|
+| `KEEPWARM_INTERVAL_MIN` | 45 | 空闲多少分钟后保活 |
+| `KEEPWARM_TTL_MIN` | 60 | 缓存有效期假设，须与服务端实际策略相符 |
+| `KEEPWARM_MAX_BUMPS` | 8 | 每路每轮最多成功保活次数 |
+| `KEEPWARM_POLL_SEC` | 60 | 状态检查间隔 |
+| `KEEPWARM_MIN_CONTEXT_TOKENS` | 20000 | 小于此上下文词元数时跳过 |
+| `KEEPWARM_QUOTA_STOP_PERCENT` | 90 | 可选额度保护阈值 |
+| `KEEPWARM_QUOTA_DIR` | 当前 Claude 配置目录 | 额度配置与兼容缓存位置 |
 
-`keepwarm-shell` reads `~/.claude/keepwarm/config.env` rather than the
-environment, because a background session's monitor never sees your shell. It
-logs each bump to `~/.claude/keepwarm/keepwarm.log`, and `/keepwarm` reports the
-last few.
+以源码 `DEFAULTS` 为准。主会话正常恢复会重置本轮合计；子代理恢复只重置自己的轮次。旧回合迟到结果不会占用新轮额度。独立日志在 `~/.claude/keepwarm/logs`，文件权限 `0600`、轮转限制 1 MiB，不记录对话正文或凭据。
 
-## Pausing it, and your status line
+## 可选配套依赖
 
-`keepwarm` registers `/keepwarm`:
+基础保活不要求状态栏。额度保护读取 [claude-statusline](https://github.com/Molun0301/claude-statusline) 写入的 vm2api 单槽缓存；它按配置的 `vm_id` 保护，不是对所有账户分别实时决策。查询失败不会新增暂停条件，已触发的保护等待有效数据确认恢复。
 
-| | |
-|---|---|
-| `/keepwarm` | whether it is on, paused, waiting or stopped, and when the next bump is due |
-| `/keepwarm pause` | no bumps in this session until you resume |
-| `/keepwarm resume` | back on, from the same idle clock |
+每日唤醒默认关闭。没有网关映射时使用当前 Claude 连接；发现状态栏网关配置时使用多账户模式，需要私密凭据文件中的 SSH（安全远程连接）服务器别名和远端目录、远端 Python 及匹配的 vm2api 数据库结构。按账户去重、固定虚拟机路由并核对服务端记录。配置无效时报告失败，不自动降级为公共路由。接口及数据库耦合见 `plugins/keepwarm/hooks/vm2api-wake.cjs`。
 
-The command answers locally, so it runs no model turn and does not reset the
-idle clock. A pause lasts for the session. It is not the kill switch: a pause
-keeps the timer and the bump count, and resuming cannot restart a keepalive
-that has already stopped.
+定时唤醒只发送正常请求，无法强制重置正在使用的额度窗口。电脑必须开机且用户定时器可运行。
 
-A status line runs as its own process and cannot ask the plugin anything, so
-`keepwarm` writes its state to `~/.claude/keepwarm/sessions/<session id>.json`
-whenever it changes:
+## 更新与卸载
 
-    {"state":"active","cold":false,"bumps":2,"maxBumps":8,"nextBumpAt":1790150371,"lastBumpAt":1790147672,"reason":"","updatedAt":1790147672}
+```bash
+claude plugin marketplace update keepwarm
+claude plugin update keepwarm@keepwarm
+git pull --ff-only
+python3 scripts/configure.py enable
+```
 
-`state` is `active`, `paused` or `stopped`, `cold` means it is waiting for your
-next turn to rebuild the cache, `nextBumpAt` is epoch seconds, and `reason` says
-why it stopped. A status line command gets `session_id` on stdin, so it can pick
-out its own session's file:
+在 Claude 执行 `/reload-plugins`。若配置了每日唤醒，再执行原来的 `/keepwarm wake HH:MM`，将新版本脚本更新到固定运行目录。需要固定版本时，从对应 Git 标签检出后通过本地市场安装。
 
-    sid=$(printf '%s' "$input" | jq -r '.session_id // empty')
-    f="$HOME/.claude/keepwarm/sessions/$sid.json"
-    [ -n "$sid" ] && [ -f "$f" ] && jq -r --argjson now "$(date +%s)" '
-      if .state == "active" then
-        "kw \(.bumps)/\(.maxBumps) " + (if .cold then "waiting"
-          else ((.nextBumpAt - $now) as $s | if $s <= 0 then "due" else "next \((($s + 59) / 60) | floor)m" end) end)
-      elif .state == "paused" then "kw paused" else "kw off" end' "$f"
+卸载先在 Claude 执行 `/keepwarm wake off`，再执行：
 
-That prints `kw 2/8 next 31m`, `kw paused` or `kw off`. The status line only
-redraws on its own schedule, so set `refreshInterval` in `statusLine` if you
-want a pause to show within the minute rather than at the next turn. The files
-are not removed when a session ends; each is one line.
+```bash
+claude plugin uninstall keepwarm@keepwarm
+python3 scripts/configure.py restore
+```
 
-## Why a bump leaves nothing on screen
+恢复助手只恢复自己管理且仍保持安装值的功能钩子字段。运行状态和日志保留，确认不再需要后可自行清理 `~/.claude/keepwarm`。
 
-keepwarm 0.4 and earlier bumped with `$.prompt.submit`, a real turn. Each one
-left a row for the ping, a `.` reply, a `Worked for 4s` line and a log line, and
-because the ping was a user message it also re-armed Claude Code's recap: a new
-`※ recap` is written once two user messages have arrived since the last one, so
-every second bump added one, generated by a model call of its own.
+## 验证与许可
 
-0.5 bumps with `$.model.fork` instead. It re-sends the main thread's last request
-as it was sent, with the ping after it and every tool denied, and nothing it
-does is stored. The prefix is byte-for-byte the one the main thread cached, so it
-is read rather than written, and it touches the same entry your next message
-will read.
+```bash
+python3 scripts/check.py
+```
 
-One detail makes that true. Claude Code gives the 1h TTL only to request sources
-on a list, and a plugin's fork is not on it, so its cache markers ask for 5m. A
-5m request still reads the 1h entry, but whether that read extends a 1h entry
-by the hour is the API's call, and any tail it writes would live 5 minutes. So
-keepwarm sets `CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL=1h` for the one request
-and puts the old value back after, which makes its markers match the main
-thread's. For those few seconds a subagent request starting elsewhere in the
-session would also get the 1h TTL. Set `KEEPWARM_TTL_MIN` below 60 and it
-leaves the variable alone.
+测试覆盖会话切换、独立子代理、额度暂停、迟到消息、日志和定时调度；模型与服务端调用由模拟实现接管。这不等同于生产环境 50 分钟缓存效果或真实额度窗口验收。
 
-There is one case where the prefix is not read whole: early in a session, when
-the main thread's last cache marker sits on the system-role message that
-carries the session-start context. A request that extends that one, with the
-same bytes before it, read 29,405 of 53,130 tokens and wrote the rest. That is
-not the fork's doing: Claude Code's own prompt-suggestion fork, and in one run
-the main thread's own second turn, measured the same miss. Once the marker sits
-on one of your messages the fork reads all of it. When a bump does land in that
-case, the entry it writes (1h, as above) is the one your next message reads, and
-later bumps read it whole.
-
-What a fork replays is the last request the main thread sent. After a
-`/compact` that request is the conversation from before it, so bumps wait for
-your first turn on the compacted one. After `/clear` there is nothing to fork
-until you send something.
-
-Claude Code's own prompt-cache tracking counts the fork, so a status line that
-shows `prompt_cache.expires_at` restarts its countdown at each bump. The sessions
-file also records `lastBumpAt`.
-
-## The two mechanisms
-
-| | `keepwarm` | `keepwarm-shell` |
-|---|---|---|
-| Needs | `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1` | nothing |
-| Background process | none | one, for the session's life |
-| Timer | `$.clock.every` | `sleep` loop |
-| Ping | `$.model.fork`, no transcript row | monitor stdout, a real turn |
-| Size gate | `$.session.usage()` context tokens | transcript bytes |
-| Safety valve | skips a bump past `KEEPWARM_TTL_MIN`; stops if a bump still creates more cache than it reads | same, read from the transcript |
-| Kill switch | `~/.claude/keepwarm-off` | same |
-| Pause | `/keepwarm pause` for one session | none; `KEEPWARM_DISABLE=1` or the kill switch |
-| Status line | `~/.claude/keepwarm/sessions/<id>.json` | none; `/keepwarm` reads the log |
-
-`keepwarm` is a TypeScript function-hooks module. Function hooks are early
-access, so that API can change between releases.
-
-## Why it stops after 8 bumps
-
-A bump costs a cache read of the whole conversation every interval. That is a
-good trade if you come back and a bad one if you do not, so keepwarm stops after
-`KEEPWARM_MAX_BUMPS` (default 8, about 8 hours) and lets the cache go cold.
-
-Both mechanisms also stop if a bump ever creates more cache than it reads
-(`cache_creation_input_tokens` above `cache_read_input_tokens` on the reply).
-That means the cache was already cold and the bump rebuilt it, warming nothing;
-repeating it would rebill that write every interval.
-
-A bump can be late. The timer does not run while the machine sleeps, and in
-`keepwarm-shell` a draft sitting in the prompt box defers every tick, so a bump
-due at 45 minutes can land after the hour. (`keepwarm`'s fork never touches the
-prompt box, so a draft does not hold it up.) Past `KEEPWARM_TTL_MIN` the cache is already cold and a
-bump can only write, so both mechanisms skip it instead of paying for the
-rebuild, and resume once your next message has rebuilt the cache. The 15 minute gap between the default interval and the TTL is the
-slack for those deferrals.
-
-## Configure
-
-`keepwarm` reads environment variables, so set them in your shell or in the
-`env` block of `~/.claude/settings.json`. `keepwarm-shell` reads
-`~/.claude/keepwarm/config.env` instead, because a background session's monitor
-does not inherit the launching shell's environment. See its `config.env.example`.
-
-| | default | |
-|---|---|---|
-| `KEEPWARM_INTERVAL_MIN` | 45 | idle minutes before a bump. Keep it under your TTL, with room for a late tick |
-| `KEEPWARM_TTL_MIN` | 60 | your prompt-cache TTL. A bump this late is skipped, since the cache is already cold |
-| `KEEPWARM_MAX_BUMPS` | 8 | bumps before it lets the cache go cold |
-| `KEEPWARM_MIN_CONTEXT_TOKENS` | 20000 | `keepwarm` only: do not warm a context smaller than this |
-| `KEEPWARM_MIN_TRANSCRIPT_KB` | 150 | `keepwarm-shell` only: the same gate, in transcript bytes |
-| `KEEPWARM_DISABLE` | | `keepwarm-shell` only: `1` turns it off |
-
-## Why the keepalive has to happen inside the session
-
-Warming from outside does not work. Running
-`claude --resume <id> --fork-session -p` against a live interactive session
-measured 0 tokens read and 54,300 created, a full write. The system prompt
-carries session-unique text (the scratchpad path contains the session id), so
-another process rebuilds the prefix rather than sharing it. Running the same
-bump twice showed it is self-consistent (the second one read 54,300, created 0):
-it warms its own cache entry, not the session's.
-
-## keepwarm-shell's monitor stays alive after it stops bumping
-
-When the monitor has nothing left to do it goes dormant rather than exiting,
-because a monitor that exits makes Claude Code announce it, and that announcement
-costs a turn in the transcript. The cost of staying is the footer count and the
-line under "Background work is running" when you quit. Neither can be turned off,
-which is the reason `keepwarm` does not ship a monitor at all.
-
-## keepwarm-shell's keepalive is a real turn
-
-If the session has a `/goal` set, or a `Stop` hook that forces continuation,
-`keepwarm-shell`'s keepalive turn can do more than print a period. `keepwarm`'s
-fork is not a turn of the session and every tool is denied to it, but it is run
-as a forked agent, so `SubagentStop` settings hooks fire when it ends.
+上游未声明开源许可证，本仓库新增自有部分采用 MIT；**不对上游代码重新授权，也不将整个仓库声明为 MIT**。[来源与许可范围](docs/公开文档/来源与许可.md) · [维护与发布](docs/公开文档/维护与发布.md)。

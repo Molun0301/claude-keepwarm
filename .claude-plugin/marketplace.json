@@ -1,25 +1,14 @@
 {
   "name": "keepwarm",
-  "description": "A prompt-cache keepalive for idle Claude Code sessions that leaves nothing on screen.",
+  "description": "keepwarm 会话与子代理保活派生维护版",
   "owner": {
-    "name": "Gabriel (delitefully)",
-    "url": "https://github.com/Delitefully"
+    "name": "Molun0301"
   },
   "plugins": [
-    {
-      "name": "keepwarm-bundle",
-      "source": "./plugins/keepwarm-bundle",
-      "description": "Kept for existing installs: it pulls in keepwarm. Install keepwarm directly."
-    },
     {
       "name": "keepwarm",
       "source": "./plugins/keepwarm",
       "description": "Keeps an idle session's prompt cache warm so the next message you type reads from cache instead of paying a full cache write."
-    },
-    {
-      "name": "keepwarm-shell",
-      "source": "./plugins/keepwarm-shell",
-      "description": "The keepalive without function hooks, as a background monitor. Only for sessions that cannot run the mod."
     }
   ]
 }
