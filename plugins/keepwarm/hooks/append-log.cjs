@@ -2,7 +2,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-const FIELDS = new Set(['time', 'event', 'plugin_version', 'session_id', 'agent_id', 'marker', 'turn_id', 'format', 'reason', 'phase', 'cache_read_input_tokens', 'cache_creation_input_tokens', 'input_tokens', 'output_tokens', 'total_bumps', 'round_bumps', 'quota_percent', 'errors', 'cache_age_seconds', 'log_path']);
+const FIELDS = new Set(['time', 'event', 'plugin_version', 'session_id', 'agent_id', 'marker', 'turn_id', 'format', 'reason', 'phase', 'cache_read_input_tokens', 'cache_creation_input_tokens', 'input_tokens', 'output_tokens', 'total_bumps', 'round_bumps', 'quota_percent', 'errors', 'cache_age_seconds', 'log_path', 'enabled', 'persisted']);
 
 function appendLog(file, entry, { maxBytes = 1024 * 1024 } = {}) {
   const name = path.basename(file);

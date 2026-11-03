@@ -11,7 +11,7 @@ async function harness(options = {}) {
   const handlers = [], files = new Map(Object.entries(options.files ?? {})), env = new Map(Object.entries({ HOME: '/mock', KEEPWARM_INTERVAL_MIN: '50', KEEPWARM_MAX_BUMPS: '12', KEEPWARM_POLL_SEC: '60', KEEPWARM_MIN_CONTEXT_TOKENS: '1', ...options.env }))
   let now = options.now ?? 1_000
   let turns = 0, sessionId = options.sessionId ?? 's1'
-  const timers = [], deliveries = [], aborts = [], forks = [], logs = [], continuations = [], refreshes = [], output = [], logCalls = [], wakeCalls = []
+  const timers = [], deliveries = [], aborts = [], forks = [], logs = [], continuations = [], refreshes = [], output = [], logCalls = [], wakeCalls = [], registeredTools = []
   const quota = { used: 0, resetAt: null, accountId: 'account-1', available: true, age: 0, sourceValid: true, stale: false, ...options.quota }
   if (quota.used >= 90 && !quota.resetAt) quota.resetAt = now + 5 * 3600000
   const agents = []
@@ -31,7 +31,10 @@ async function harness(options = {}) {
         return JSON.stringify({_source:quota.sourceValid ? 'vm2api:https://quota.example:fixture-vm-a' : '错误来源', _ts:now-quota.age, data:{vm_id:'fixture-vm-a',account_id:quota.accountId,five_hour:{used_percent:quota.used,reset_at:quota.resetAt === '' ? null : new Date(quota.resetAt ?? now+5*3600000).toISOString(),reset_elapsed:quota.resetElapsed === true,stale:quota.stale}}})
       }
       throw Error('文件不存在')
-    }, write: async (path, text) => files.set(path, text), exists: async path => path.endsWith('/local-statusline.js') || files.has(path) },
+    }, write: async (path, text) => {
+      if (options.onStateWrite && path.includes('/keepwarm/sessions/')) await options.onStateWrite(path, text)
+      files.set(path, text)
+    }, exists: async path => path.endsWith('/local-statusline.js') || files.has(path) },
     process: { run: async (argv, init) => {
       if (argv[1]?.endsWith('/daily-wake.cjs')) {
         wakeCalls.push({argv,init})
@@ -48,6 +51,7 @@ async function harness(options = {}) {
     } },
     prompt: { submit: async value => { continuations.push(value); return {text:value.text} } },
     command: { register: async () => {} },
+    tool: { register: async value => { registeredTools.push(value); return {tool:'mcp__keepwarm__'+value.name} } },
     ui: { log: async text => logs.push(text) },
     model: { fork: async request => { forks.push(request); return forkResult } },
     turn: { abort: async value => { aborts.push(value) } },
@@ -99,9 +103,192 @@ async function harness(options = {}) {
   }
   await emit('session.start', {})
   const journal = () => (files.get(`/mock/.claude/keepwarm/logs/${sessionId}.jsonl`)??'').trim().split('\n').filter(Boolean).map(JSON.parse)
-  return { $, env, files, timers, deliveries, aborts, forks, logs, agents, emit, step, turn, spawn, tick, flush, state, answer, continuations, refreshes, output, quota, journal, logCalls, wakeCalls, setSession: value => { sessionId = value }, setQuota: value => { Object.assign(quota,value); if(quota.used>=90&&!quota.resetAt) quota.resetAt=now+5*3600000 }, setFork: value => forkResult = value, setDelivery: value => deliveryResult = value, setNow: value => { now = value }, get now() { return now } }
+  const control = async (action, agent_id, agentId) => {
+    const reply=await emit('tool.call', { tool:'mcp__keepwarm__keepwarm_control', action, ...(agent_id === undefined ? {} : {agent_id}), ...(agentId ? {agentId} : {}) })
+    assert.equal(typeof reply.result,'string','注册工具必须按宿主契约返回JSON文本')
+    return {...reply,result:JSON.parse(reply.result)}
+  }
+  return { $, env, files, timers, deliveries, aborts, forks, logs, agents, emit, step, turn, spawn, tick, flush, state, answer, continuations, refreshes, output, quota, journal, logCalls, wakeCalls, registeredTools, control, setSession: value => { sessionId = value }, setQuota: value => { Object.assign(quota,value); if(quota.used>=90&&!quota.resetAt) quota.resetAt=now+5*3600000 }, setFork: value => forkResult = value, setDelivery: value => deliveryResult = value, setNow: value => { now = value }, get now() { return now } }
 }
 const notice = (id, answer) => `<system-reminder><task-notification><task-id>${id}</task-id><status>completed</status><result>${answer}</result></task-notification></system-reminder>`
+
+test('按对话开关：注册可供主代理直接调用的查询与控制工具', async () => {
+  const h = await harness()
+  assert.equal(h.registeredTools[0].name, 'keepwarm_control')
+  assert.equal(h.registeredTools[0].isDeferred, false)
+  const answer = await h.control('status')
+  assert.equal(answer.result.ok, true)
+  assert.deepEqual(answer.result.targets.map(t => t.agent_id), ['main'])
+  assert.equal(h.forks.length+h.deliveries.length, 0)
+})
+
+test('按对话开关：关闭单个子代理，其他子代理继续，普通续做不重开', async () => {
+  const h = await harness({ env:{KEEPWARM_INTERVAL_MIN:'55'} })
+  for (const id of ['A','B']) { await h.spawn(id); await h.turn(id) }
+  assert.equal((await h.control('off','A')).result.targets[0].keepwarm_enabled, false)
+  await h.turn('A'); await h.tick(55)
+  assert.equal(h.state().targets.find(r=>r.id==='A').manualOff, true)
+  assert.deepEqual(h.deliveries.map(d=>d.to.agentId), ['B'])
+  assert.equal(h.state().state, 'active')
+})
+
+test('按对话开关：主对话可独立关闭，子代理仍保活，55分钟和12次保留', async () => {
+  const h = await harness({ env:{KEEPWARM_INTERVAL_MIN:'55'} })
+  await h.turn(); await h.spawn('A'); await h.turn('A')
+  await h.emit('command.run',{command:'keepwarm',args:'off main'})
+  await h.tick(55)
+  assert.equal(h.forks.length,0); assert.equal(h.deliveries.length,1)
+  assert.equal(h.state().targets.find(t=>t.id==='main').manualOff,true)
+  const result=await h.control('status')
+  assert.equal(result.result.interval_minutes,55); assert.equal(result.result.max_bumps,12)
+})
+
+test('按对话开关：重载持久保留关闭，旧状态默认开启', async () => {
+  const h=await harness(); await h.spawn('A'); await h.turn('A'); await h.control('off','A')
+  const again=await harness({files:Object.fromEntries(h.files),now:h.now})
+  await again.turn('A'); await again.tick(50)
+  assert.equal(again.deliveries.length,0)
+  assert.equal((await again.control('status','A')).result.targets[0].manual_off,true)
+  const old={version:4,state:'active',roundBumps:0,targets:[{id:'main',label:'主对话',requestAt:1000,contextTokens:100000,bumps:0,roundBumps:0}]}
+  const migrated=await harness({files:{'/mock/.claude/keepwarm/sessions/s1.json':JSON.stringify(old)}})
+  await migrated.tick(50); assert.equal(migrated.forks.length,1)
+})
+
+test('按对话开关：开启保留原缓存年龄，过期不重建，上限不重置', async () => {
+  const h=await harness(); await h.turn(); await h.control('off')
+  await h.tick(61); await h.control('on'); await h.tick(1)
+  assert.equal(h.forks.length,0)
+  assert.equal(h.state().targets[0].requestAt,1000)
+  await h.turn(); await h.tick(50)
+  for(let i=1;i<12;i++) await h.tick(50)
+  await h.control('off'); await h.control('on'); await h.tick(1)
+  assert.equal(h.forks.length,12); assert.equal(h.state().targets[0].roundBumps,12)
+})
+
+test('按对话开关：关闭期间额度保护和重置继续仍有效', async () => {
+  const h=await harness({quota:{used:95,resetAt:1000+3600000}})
+  await h.control('off','main')
+  await h.turn()
+  assert.equal(h.state().workPaused,true); assert.deepEqual(h.state().deferredWork,['main'])
+  h.setQuota({used:0,resetAt:1000+6*3600000}); await h.tick(1)
+  assert.equal(h.continuations.length,1)
+  assert.equal(h.state().targets[0].manualOff,true)
+})
+
+test('按对话开关：查询给出宿主状态与保活开关两个维度', async () => {
+  const h=await harness();await h.spawn('A');await h.turn('A')
+  h.agents[0].status='completed'
+  const answer=(await h.control('status','A')).result.targets[0]
+  assert.equal(answer.host_status,'completed');assert.equal(answer.keepwarm_enabled,true)
+  assert.equal(answer.model,'模拟模型');assert.equal(answer.agent_type,'general-purpose')
+  await h.control('off','A')
+  const result=await h.emit('command.run',{command:'keepwarm',args:'status A'})
+  assert.match(result.text,/手动关闭/)
+})
+
+test('按对话开关：主代理控制只接受本会话目标，子代理不能更改或查询', async () => {
+  const h=await harness();await h.spawn('A')
+  for(const action of ['off','on','status']){
+    const reply=await h.control(action,'main','A')
+    assert.equal(reply.isError,true);assert.equal(reply.result.error,'main_only')
+  }
+  const bad=await h.control('off','foreign')
+  assert.equal(bad.isError,true);assert.equal(bad.result.error,'unknown_target')
+  const invalid=await h.control('delete','main')
+  assert.equal(invalid.isError,true)
+  assert.equal(h.forks.length+h.deliveries.length,0)
+})
+
+test('按对话开关：已经投递的保活迟到仍计量和过滤，不能重开', async () => {
+  const h=await harness();await h.spawn('A');await h.turn('A');await h.tick(50)
+  await h.control('off','A')
+  const {marker}=await h.answer('A')
+  assert.equal(h.state().agentBumps,1);assert.equal(h.state().targets.find(t=>t.id==='A').manualOff,true)
+  const result=await h.emit('prompt.submit',{origin:{kind:'task-notification'},text:notice('A',marker)},{text:'保留'})
+  assert(result.drop)
+  await h.tick(50);assert.equal(h.deliveries.length,1)
+})
+
+test('按对话开关：发送前等待日志期间关闭，主对话和子代理都不发请求', async () => {
+  for(const id of ['main','A']){
+    const h=await harness();if(id==='A')await h.spawn('A');await h.turn(id)
+    const original=h.$.process.run
+    let release, reached
+    const ready=new Promise(resolve=>{reached=resolve})
+    h.$.process.run=async(argv,init)=>{
+      if(init?.stdin&&JSON.parse(init.stdin).event==='ping_scheduled'){
+        reached();await new Promise(resolve=>{release=resolve})
+      }
+      return original(argv,init)
+    }
+    await h.tick(50);await ready
+    const closing=h.control('off',id)
+    await h.flush();release();await closing;await h.flush()
+    assert.equal(h.deliveries.length+h.forks.length,0)
+  }
+})
+
+test('按对话开关：持久化失败明确返回，当前进程仍阻止后续保活', async () => {
+  let fail=false
+  const h=await harness({onStateWrite:async()=>{if(fail)throw Error('模拟磁盘失败')}})
+  await h.turn();fail=true
+  const reply=await h.control('off','main')
+  assert.equal(reply.isError,true);assert.equal(reply.result.error,'state_write_failed')
+  await h.tick(50);assert.equal(h.forks.length,0)
+})
+
+test('按对话开关：并发旧状态写入完成后不会覆盖新关闭状态', async () => {
+  let hold=false,release,reached
+  const ready=new Promise(resolve=>{reached=resolve})
+  const h=await harness({onStateWrite:async()=>{
+    if(hold){hold=false;reached();await new Promise(resolve=>{release=resolve})}
+  }})
+  await h.turn();hold=true
+  const work=h.turn();await ready
+  const closing=h.control('off','main');await h.flush();release()
+  await Promise.all([work,closing])
+  assert.equal(h.state().targets[0].manualOff,true)
+})
+
+test('按对话开关：清空会话不把旧关闭选项串到新会话', async () => {
+  const h=await harness();await h.turn();await h.control('off','main')
+  await h.emit('session.end',{reason:'clear',sessionId:'s1'});h.setSession('fresh');await h.turn()
+  assert.equal((await h.control('status','main')).result.targets[0].keepwarm_enabled,true)
+  assert.equal(JSON.parse(h.files.get('/mock/.claude/keepwarm/sessions/s1.json')).targets[0].manualOff,true)
+})
+
+test('按对话开关：有效缓存重新开启后沿用原请求时间续期', async () => {
+  const h=await harness();await h.spawn('A');await h.turn('A');await h.control('off','A')
+  await h.tick(30);await h.control('on','A');await h.tick(19)
+  assert.equal(h.deliveries.length,0)
+  await h.tick(1);assert.equal(h.deliveries[0].to.agentId,'A')
+})
+
+test('按对话开关：主对话在途结果迟到不会清掉手动关闭', async () => {
+  const h=await harness();await h.turn()
+  let finish;h.setFork(new Promise(resolve=>{finish=resolve}))
+  await h.tick(50);await h.control('off','main')
+  finish({isAnswered:true,text:'.',usage:rich});await h.flush()
+  assert.equal(h.state().mainBumps,1);assert.equal(h.state().targets[0].manualOff,true)
+  await h.tick(50);assert.equal(h.forks.length,1)
+})
+
+test('按对话开关：目标开启不解除整插件暂停，查询仍可使用', async () => {
+  const h=await harness();await h.turn()
+  await h.emit('command.run',{command:'keepwarm',args:'pause'})
+  await h.control('off','main');const reply=await h.control('on','main')
+  assert.equal(reply.result.plugin_enabled,false)
+  assert.equal(reply.result.targets[0].effective_state,'plugin_paused')
+  await h.tick(50);assert.equal(h.forks.length,0)
+})
+
+test('按对话开关：宿主列表暂不可读仍返回已保存开关并标明未知', async () => {
+  const h=await harness();await h.spawn('A');await h.turn('A');await h.control('off','A')
+  h.$.agent.list=async()=>{throw Error('模拟宿主接口不可用')}
+  const result=(await h.control('status','A')).result
+  assert.equal(result.ok,true);assert.equal(result.targets[0].manual_off,true)
+  assert.equal(result.targets[0].host_status,'unknown');assert(result.host_status_error)
+})
 
 test('恢复历史会话不重新触发初始化事件时仍重绑状态并继续保活', async () => {
   const target = { version: 4, state: 'active', roundBumps: 2, targets: [{ id: 'main', label: '主对话', bumps: 7, roundBumps: 2, requestAt: 1000, contextTokens: 100000 }] }

@@ -13,10 +13,12 @@ const rows = file => fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.p
 test('日志真正追加且仅本用户可读，不保存正文、工具输入和凭据字段', () => {
   const dir = temporary(), file = path.join(dir, 'logs/s1.jsonl');
   try {
-    appendLog(file, { session_id: 's1', event: 'first', prompt: '私密正文', credentials: '私密凭据', input: { command: '工具内容' } });
+    appendLog(file, { session_id: 's1', event: 'first', enabled: false, persisted: true, prompt: '私密正文', credentials: '私密凭据', input: { command: '工具内容' } });
     appendLog(file, { session_id: 's1', event: 'second', cache_read_input_tokens: 12345 });
     assert.equal(rows(file).length, 2);
     assert.deepEqual(rows(file).map(x => x.event), ['first', 'second']);
+    assert.equal(rows(file)[0].enabled, false);
+    assert.equal(rows(file)[0].persisted, true);
     assert.equal(fs.statSync(file).mode & 0o777, 0o600);
     assert.equal(fs.statSync(path.dirname(file)).mode & 0o777, 0o700);
     assert(!fs.readFileSync(file, 'utf8').includes('私密'));

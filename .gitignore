@@ -12,3 +12,8 @@ __pycache__/
 /page/snapshot.js
 *.tmp
 .DS_Store
+
+.claude/types/
+assets/candidates/
+/.gitnexus/
+**/.claude-plugin/types/

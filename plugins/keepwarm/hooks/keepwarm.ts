@@ -2,7 +2,7 @@ import type { Register, Timer } from 'claude-code'
 
 // 主对话保留原快照重放；子代理通过原标识继续自己的对话。
 const MAIN = 'main'
-const PLUGIN_VERSION = '0.9.3'
+const PLUGIN_VERSION = '0.10.0'
 const MAIN_PING = '[keepwarm] cache keepalive - reply with one period, nothing else.'
 const DEFAULTS = { idleMinutes: 45, ttlMinutes: 60, maxBumps: 8, minContextTokens: 20_000, pollSeconds: 60, quotaStopPercent: 90 }
 const MAX_ERRORS = 3
@@ -11,7 +11,7 @@ const PING_TIMEOUT_MS = 90_000
 const NOTICE_TTL_MS = 5 * 60_000
 
 type Pending = { marker: string; text: string; sentAt: number; routeRound: number; displayRound: number; turnId?: string; requestAt?: number; usage?: any; toolDenied?: boolean; abortReason?: 'timeout' | 'tool_denied' | 'session_end' }
-type Route = { id: string; label: string; peerName: string; busy: boolean; turnId: string; workTurnId: string; requestAt: number; contextTokens: number; bumps: number; roundBumps: number; roundId: number; errors: number; lastBumpAt: number; cold: boolean; stopped: boolean; reason: string; lastRead: number; lastCreated: number; pending: Pending | null; blocked: Pending | null }
+type Route = { id: string; label: string; peerName: string; model: string; agentType: string; manualOff: boolean; busy: boolean; turnId: string; workTurnId: string; requestAt: number; contextTokens: number; bumps: number; roundBumps: number; roundId: number; errors: number; lastBumpAt: number; cold: boolean; stopped: boolean; reason: string; lastRead: number; lastCreated: number; pending: Pending | null; blocked: Pending | null }
 let config = DEFAULTS
 let routes = new Map<string, Route>()
 let notices = new Map<string, { answer: string; at: number; sender?: string }>()
@@ -35,6 +35,7 @@ let logHelper = ''
 let logSessionId = ''
 let logError = ''
 let logQueue: Promise<void> = Promise.resolve()
+let stateQueue: Promise<void> = Promise.resolve()
 let quotaDir = ''
 let quota = { blocked: false, usedPercent: null as number | null, resetAt: '', accountId: '', blockedResetAt: '', blockedAccountId: '', error: '' }
 let deferredWork = new Set<string>()
@@ -50,7 +51,7 @@ const number = (value: string | undefined, fallback: number): number => {
   return Number.isFinite(n) && n > 0 ? n : fallback
 }
 const count = (value: unknown): number => Number.isSafeInteger(value) && Number(value) >= 0 ? Number(value) : 0
-const newRoute = (id: string, label: string): Route => ({ id, label, peerName: /^a(.+)-[a-f0-9]{16}$/.exec(id)?.[1] ?? '', busy: false, turnId: '', workTurnId: '', requestAt: 0, contextTokens: 0, bumps: 0, roundBumps: 0, roundId: 0, errors: 0, lastBumpAt: 0, cold: true, stopped: false, reason: '', lastRead: 0, lastCreated: 0, pending: null, blocked: null })
+const newRoute = (id: string, label: string): Route => ({ id, label, peerName: /^a(.+)-[a-f0-9]{16}$/.exec(id)?.[1] ?? '', model: '', agentType: id === MAIN ? 'main' : '', manualOff: false, busy: false, turnId: '', workTurnId: '', requestAt: 0, contextTokens: 0, bumps: 0, roundBumps: 0, roundId: 0, errors: 0, lastBumpAt: 0, cold: true, stopped: false, reason: '', lastRead: 0, lastCreated: 0, pending: null, blocked: null })
 const supported = (type: string): boolean => !['Explore', 'Plan'].includes(type)
 const pingFormat = (text: string, pending: Pending): string | null => {
   if (text === pending.text) return 'plain'
@@ -98,15 +99,21 @@ const syncEnablement = async ($: any): Promise<boolean> => {
   return active()
 }
 
-const publish = async ($: any): Promise<void> => {
-  if (!statePath) return
-  try {
+// 顺序写入并在真正执行时取当前状态，避免旧快照覆盖刚设置的手动开关。
+const publish = async ($: any): Promise<boolean> => {
+  const file = statePath, generation = sessionGeneration
+  if (!file) return false
+  let saved = false
+  const writing = stateQueue.then(async () => {
+    if (generation !== sessionGeneration || file !== statePath) return
+    try {
     const list = [...routes.values()]
     const main = routes.get(MAIN)
     const now = await $.clock.now()
-    const open = list.filter(r => !r.stopped)
+    if (generation !== sessionGeneration || file !== statePath) return
+    const open = list.filter(r => !r.stopped && !r.manualOff)
     const next = open.filter(r => r.requestAt > 0 && !r.cold).map(r => r.requestAt + config.idleMinutes * 60_000)
-    await $.fs.write(statePath, JSON.stringify({
+    await $.fs.write(file, JSON.stringify({
       version: 4,
       pluginVersion: PLUGIN_VERSION,
       sessionId: logSessionId,
@@ -128,9 +135,14 @@ const publish = async ($: any): Promise<void> => {
       nextBumpAt: active() && next.length ? Math.ceil(Math.min(...next) / 1000) : 0,
       lastBumpAt: Math.floor(Math.max(0, ...list.map(r => r.lastBumpAt)) / 1000),
       updatedAt: Math.floor(now / 1000),
-      targets: list.map(r => ({ id: r.id, label: r.label, peerName: r.peerName, state: routeState(r), cold: r.cold, busy: r.busy, bumps: r.bumps, roundBumps: r.roundBumps, workTurnId: r.workTurnId, maxBumps: config.maxBumps, requestAt: r.requestAt, contextTokens: r.contextTokens, lastBumpAt: r.lastBumpAt, lastRead: r.lastRead, lastCreated: r.lastCreated, reason: r.reason })),
+      targets: list.map(r => ({ id: r.id, label: r.label, peerName: r.peerName, model: r.model, agentType: r.agentType, manualOff: r.manualOff, state: routeState(r), cold: r.cold, busy: r.busy, bumps: r.bumps, roundBumps: r.roundBumps, workTurnId: r.workTurnId, maxBumps: config.maxBumps, requestAt: r.requestAt, contextTokens: r.contextTokens, lastBumpAt: r.lastBumpAt, lastRead: r.lastRead, lastCreated: r.lastCreated, reason: r.reason })),
     }) + '\n')
-  } catch { /* 状态显示故障不打断用户任务。 */ }
+      saved = true
+    } catch { /* 普通状态显示故障不打断任务；开关操作单独返回保存失败。 */ }
+  })
+  stateQueue = writing.catch(() => {})
+  await stateQueue
+  return saved
 }
 
 // 与状态栏共用同一份已用比例；不按美元估算额度，也不预测在途请求消耗。
@@ -251,6 +263,7 @@ const findRoute = async ($: any, id?: string): Promise<Route | undefined> => {
   const agent = agents.find((a: any) => a.id === id)
   if (!agent || !supported(agent.type) || routes.size > MAX_AGENTS) return undefined
   const route = newRoute(id, agent.description || id)
+  route.agentType = agent.type
   routes.set(id, route)
   return route
 }
@@ -322,6 +335,10 @@ const bumpMain = async ($: any, r: Route): Promise<void> => {
   await audit($, 'ping_scheduled', { agent_id: MAIN, marker, cache_age_seconds: Math.floor((sentAt - r.requestAt) / 1000) })
   try {
     await audit($, 'ping_request', { agent_id: MAIN, marker, quota_percent: quota.usedPercent })
+    if (!active() || r.manualOff || generation !== sessionGeneration) {
+      await audit($, 'ping_cancelled', { agent_id: MAIN, marker, reason: 'disabled_before_request' })
+      return
+    }
     const result = await $.model.fork({ prompt: MAIN_PING })
     if (generation !== sessionGeneration || ended) return
     if (!('usage' in result)) {
@@ -348,6 +365,11 @@ const bumpAgent = async ($: any, r: Route, now: number): Promise<void> => {
   r.pending = pending
   await audit($, 'ping_scheduled', { agent_id: r.id, marker, cache_age_seconds: Math.floor((now - r.requestAt) / 1000) })
   try {
+    if (!active() || r.manualOff || generation !== sessionGeneration) {
+      if (r.pending === pending) r.pending = null
+      await audit($, 'ping_cancelled', { agent_id: r.id, marker, reason: 'disabled_before_request' })
+      return
+    }
     const result = await $.session.send({ to: { agentId: r.id }, text })
     if (generation !== sessionGeneration || ended) return
     await audit($, result.isDelivered ? 'ping_delivered' : 'ping_delivery_failed', { agent_id: r.id, marker })
@@ -386,7 +408,7 @@ const tick = async ($: any): Promise<void> => {
     // 每次只发起一路，其他到期会话留到后续检查，避免同时争抢账号额度。
     const ordered = [...routes.values()].sort((a, b) => a.requestAt - b.requestAt)
     for (const r of ordered) {
-      if (r.busy || r.stopped || r.cold || r.requestAt <= 0) continue
+      if (r.manualOff || r.busy || r.stopped || r.cold || r.requestAt <= 0) continue
       const idle = now - r.requestAt
       if (idle < config.idleMinutes * 60_000) continue
       if (idle >= config.ttlMinutes * 60_000) { r.cold = true; r.reason = '已过缓存有效期，等待正常对话'; await audit($, 'route_waiting', { agent_id: r.id, reason: 'cache_expired' }); continue }
@@ -440,6 +462,9 @@ const start = async ($: any): Promise<void> => {
         if (typeof item.id !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(item.id)) continue
         const r = newRoute(item.id, typeof item.label === 'string' ? item.label : item.id)
         if (typeof item.peerName === 'string') r.peerName = item.peerName
+        r.manualOff = item.manualOff === true
+        r.model = typeof item.model === 'string' ? item.model : ''
+        r.agentType = typeof item.agentType === 'string' ? item.agentType : r.agentType
         r.bumps = count(item.bumps); r.requestAt = Number(item.requestAt) || 0
         r.roundBumps = saved.version === 4 ? Math.min(r.bumps, count(item.roundBumps)) : r.bumps
         r.workTurnId = saved.version === 4 && typeof item.workTurnId === 'string' ? item.workTurnId : ''
@@ -461,8 +486,18 @@ const start = async ($: any): Promise<void> => {
   if (await syncEnablement($)) await updateQuota($)
   timer = $.clock.every(config.pollSeconds * 1000, () => void tick($).catch(error => note($, `保活检查异常：${String(error)}`)))
   try {
-    await $.command.register({ name: 'keepwarm', description: '插件开关、额度保护、会话状态与每日唤醒', argumentHint: '[pause|resume|status|wake [HH:MM|off|status]]' })
+    await $.command.register({ name: 'keepwarm', description: '按对话保活开关、查询、额度保护与每日唤醒', argumentHint: '[off|on|status [agent_id]|pause|resume|wake [HH:MM|off|status]]' })
   } catch (error) { await note($, `状态命令未注册：${String(error)}`) }
+  try {
+    await $.tool.register({
+      name: 'keepwarm_control', isDeferred: false,
+      description: '仅主代理使用：查询本会话主对话及子代理的保活开关、模型和宿主状态；按任务需要关闭或开启指定对话保活。关闭不终止工作，正常续做不会自动重开。操作在本地执行，不向目标发送模型请求。',
+      inputSchema: { type: 'object', properties: {
+        action: { type: 'string', enum: ['off', 'on', 'status'], description: 'off关闭、on开启、status查询。' },
+        agent_id: { type: 'string', description: '目标代理的准确标识，主对话用main。关闭或开启时省略表示main；查询时省略返回全部已跟踪目标。' },
+      }, required: ['action'], additionalProperties: false },
+    })
+  } catch (error) { await note($, `保活控制工具未注册：${String(error)}`) }
   await audit($, 'session_started', { log_path: logPath })
   await publish($)
 }
@@ -486,6 +521,59 @@ const wakeCommand = async ($: any, args: string): Promise<string> => {
   return (result.exitCode === 0 ? result.stdout : `每日唤醒设置失败：${result.stderr}`).trim()
 }
 
+const control = async ($: any, action: unknown, target?: unknown): Promise<any> => {
+  const fail = (error: string, message: string): any => ({ ok: false, error, message })
+  if (!['off', 'on', 'status'].includes(action as string)) return fail('invalid_action', '操作必须是off、on或status。')
+  if (target !== undefined && (typeof target !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(target))) return fail('invalid_target', '请使用main或本会话中的准确代理标识。')
+  if (!await ensureSession($, true)) return fail('session_ended', '当前会话已结束。')
+  await syncEnablement($)
+  let agents: any[] = [], hostError = ''
+  try { agents = await $.agent.list() } catch { hostError = '暂未取得宿主状态' }
+  const id = (target as string | undefined) ?? (action === 'status' ? undefined : MAIN)
+  let selected = id ? routes.get(id) : undefined
+  if (id && !selected) {
+    const agent = agents.find(a => a.id === id)
+    if (!agent) return fail('unknown_target', '本会话没有这个已跟踪代理，请先查询目标列表。')
+    if (!supported(agent.type)) return fail('unsupported_target', '该类型未纳入当前插件自动保活。')
+    if (routes.size > MAX_AGENTS) return fail('target_limit', '已达到可跟踪子代理数量上限。')
+    selected = newRoute(id, agent.description || id)
+    selected.agentType = agent.type
+    routes.set(id, selected)
+  }
+  let saved = true
+  if (action !== 'status') {
+    selected!.manualOff = action === 'off'
+    // 保留缓存年龄、次数、在途请求和正常工作；手动开关不借用失败停止状态。
+    saved = await publish($)
+    await audit($, 'target_keepwarm_changed', { agent_id: selected!.id, enabled: !selected!.manualOff, persisted: saved })
+  }
+  const now = await $.clock.now()
+  const list = selected ? [selected] : [...routes.values()]
+  const targets = list.map(r => {
+    const host = agents.find(a => a.id === r.id)
+    const age = r.requestAt > 0 ? Math.max(0, Math.floor((now - r.requestAt) / 1000)) : null
+    const inFlight = !!r.pending || (r.id === MAIN && mainBumping)
+    const state = r.manualOff ? 'manual_off' : !active() ? paused ? 'plugin_paused' : globallyOff ? 'plugin_off' : 'session_ended' : r.stopped ? 'stopped' : inFlight ? 'in_flight' : r.busy ? 'busy' : r.cold || age === null || age >= config.ttlMinutes * 60 ? 'cold' : r.roundBumps >= config.maxBumps ? 'round_limit' : r.contextTokens < config.minContextTokens ? 'small_context' : age >= config.idleMinutes * 60 ? 'due' : 'waiting'
+    const eligible = state === 'due' || state === 'waiting'
+    return {
+      agent_id: r.id, label: r.label, model: r.model || 'unknown', agent_type: r.agentType || host?.type || 'unknown',
+      host_status: r.id === MAIN ? r.busy ? 'running' : 'idle' : host?.status || (hostError ? 'unknown' : 'not_listed'),
+      keepwarm_enabled: !r.manualOff, manual_off: r.manualOff, effective_state: state, eligible, in_flight: inFlight,
+      context_tokens: r.contextTokens, bumps: r.bumps, round_bumps: r.roundBumps, max_bumps: config.maxBumps,
+      cache_age_seconds: age, next_bump_at: eligible ? Math.ceil((r.requestAt + config.idleMinutes * 60_000) / 1000) : 0,
+      reason: r.manualOff ? '手动关闭保活' : r.reason,
+    }
+  })
+  return { ok: saved, ...(saved ? {} : { error: 'state_write_failed', message: '开关仅在当前进程中生效，保存失败；重载前请重新设置并确认。' }), session_id: logSessionId, plugin_enabled: active(), work_paused: active() && quota.blocked, interval_minutes: config.idleMinutes, max_bumps: config.maxBumps, ...(hostError ? { host_status_error: hostError } : {}), targets }
+}
+
+const controlText = (result: any): string => {
+  const lines = [result.ok ? `保活查询；空闲${result.interval_minutes}分钟，每路每轮最多${result.max_bumps}次。` : result.message]
+  const states: Record<string, string> = { manual_off: '手动关闭', plugin_paused: '整个插件已暂停', plugin_off: '整个插件已关闭', session_ended: '会话已结束', stopped: '已停止', in_flight: '已有保活在途', busy: '工作中', cold: '等待正常工作建立缓存', round_limit: '达到本轮上限', small_context: '上下文较小', due: '已到保活时间', waiting: '等待保活时间' }
+  for (const r of result.targets ?? []) lines.push(`${r.label} (${r.agent_id})：保活${r.keepwarm_enabled ? '开启' : '手动关闭'}；${states[r.effective_state]}；宿主${r.host_status}；模型${r.model}；累计${r.bumps}，本轮${r.round_bumps}/${r.max_bumps}${r.in_flight ? '；已经发出的请求会继续结束' : ''}`)
+  return lines.join('\n')
+}
+
 const status = async ($: any): Promise<string> => {
   const now = await $.clock.now()
   const lines = [active() ? `插件已开启；空闲 ${config.idleMinutes} 分钟，每路最多 ${config.maxBumps} 次。` : `插件${paused ? '已暂停' : '已全局关闭'}；保活、额度拦截、自动继续均停用。`, `最近5小时额度：${quota.usedPercent ?? '--'}% / 停线 ${config.quotaStopPercent}%；普通工作${active() && quota.blocked ? '已暂停，重置后自动继续' : '可继续'}；待继续 ${deferredWork.size} 路。`]
@@ -493,7 +581,7 @@ const status = async ($: any): Promise<string> => {
   lines.push(`日志：${logPath || '不可用'}${logError ? `（${logError}）` : ''}`)
   for (const r of routes.values()) {
     const left = Math.max(0, Math.ceil((r.requestAt + config.idleMinutes * 60_000 - now) / 60_000))
-    const state = !active() ? '随插件停用' : r.stopped ? r.reason : r.pending ? '正在保活' : r.busy ? '工作中' : r.cold ? (r.reason || '等待正常对话') : `${left} 分钟后保活`
+    const state = r.manualOff ? '手动关闭保活' : !active() ? '随插件停用' : r.stopped ? r.reason : r.pending ? '正在保活' : r.busy ? '工作中' : r.cold ? (r.reason || '等待正常对话') : `${left} 分钟后保活`
     lines.push(`${r.label}${r.id === MAIN ? '' : ` (${r.id})`}：累计 ${r.bumps}，本轮 ${r.roundBumps}/${config.maxBumps}，${state}`)
   }
   lines.push(await wakeCommand($, 'status'))
@@ -529,6 +617,17 @@ const isOwnNotice = (e: any): boolean => {
 }
 
 export const register: Register = (on) => {
+  on('tool.call', { tool: 'mcp__keepwarm__keepwarm_control' }, async ($, e) => {
+    if (e.agentId) {
+      const text = JSON.stringify({ ok: false, error: 'main_only', message: '仅主代理可查询和控制本会话保活。' })
+      return { result: text, text, isError: true }
+    }
+    const args = e as any
+    const result = await control($, args.action, args.agent_id)
+    // 注册工具的返回契约是文本或内容块数组，结构化状态用JSON文本传给模型。
+    const text = JSON.stringify(result)
+    return { result: text, text, ...(result.ok ? {} : { isError: true }) }
+  })
   on('session.start', async ($, e, next) => { await start($); return next(e) })
   on('session.end', async ($, e, next) => {
     ended = true; switching = e.reason === 'clear' || e.reason === 'resume'; sessionGeneration += 1
@@ -548,6 +647,7 @@ export const register: Register = (on) => {
     if (generation !== sessionGeneration || ended) return result
     if (result.agentId && supported(e.subagentType) && routes.size <= MAX_AGENTS && !routes.has(result.agentId)) routes.set(result.agentId, newRoute(result.agentId, e.description || result.agentId))
     if (result.agentId && routes.has(result.agentId)) routes.get(result.agentId)!.peerName = result.teammateId?.split('@')[0] ?? e.name ?? routes.get(result.agentId)!.peerName
+    if (result.agentId && routes.has(result.agentId)) { const r = routes.get(result.agentId)!; r.model = result.model || r.model; r.agentType = e.subagentType }
     return result
   })
   on('session.receive', async ($, e, next) => {
@@ -597,7 +697,7 @@ export const register: Register = (on) => {
       await publish($)
       return yield* pauseStep(e, quotaMessage())
     }
-    if (r && !pending && !mainKeepalive) { beginWork(r, e.turnId); await publish($) }
+    if (r && !pending && !mainKeepalive) { r.model = e.model || r.model; beginWork(r, e.turnId); await publish($) }
     const at = await $.clock.now()
     if (pending) { pending.requestAt = at; await audit($, 'ping_request', { agent_id: r!.id, marker: pending.marker, turn_id: e.turnId, quota_percent: quota.usedPercent }) }
     const stream = next(e)
@@ -665,8 +765,16 @@ export const register: Register = (on) => {
   })
   on('command.run', { command: 'keepwarm' }, async ($, e) => {
     await ensureSession($, true)
-    const verb = e.args.trim().toLowerCase()
-    if (verb === 'wake' || verb.startsWith('wake ')) return { text: await wakeCommand($, verb.slice(4).trim()) }
+    const raw = e.args.trim()
+    const [action, target, ...extra] = raw.split(/\s+/)
+    const verb = action.toLowerCase()
+    if (['off', 'on', 'status'].includes(verb)) {
+      if (extra.length) return { text: '用法：/keepwarm off|on|status [准确代理标识或main]' }
+      const result = await control($, verb, target)
+      return { text: controlText(result) + (verb === 'status' && !target && result.ok ? `\n${await wakeCommand($, 'status')}` : '') }
+    }
+    if (verb === 'wake') return { text: await wakeCommand($, raw.slice(action.length).trim().toLowerCase()) }
+    if (target) return { text: '用法：/keepwarm [off|on|status [代理标识]|pause|resume|wake [HH:MM|off|status]]' }
     if (verb === 'pause') paused = true
     else if (verb === 'resume') paused = false
     else if (verb !== '' && verb !== 'status') return { text: '用法：/keepwarm [pause|resume|status|wake [HH:MM|off|status]]' }
