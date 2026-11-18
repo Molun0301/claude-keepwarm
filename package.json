@@ -1,6 +1,6 @@
 {
   "name": "claude-keepwarm-local",
-  "version": "0.10.0",
+  "version": "0.12.2",
   "private": true,
   "description": "keepwarm 派生维护版",
   "scripts": {

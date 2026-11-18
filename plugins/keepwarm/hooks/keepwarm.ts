@@ -1,25 +1,35 @@
-import type { Register, Timer } from 'claude-code'
+import type { AgentInfo, Register, Timer } from 'claude-code'
 
 // 主对话保留原快照重放；子代理通过原标识继续自己的对话。
 const MAIN = 'main'
-const PLUGIN_VERSION = '0.10.0'
+const PLUGIN_VERSION = '0.12.2'
 const MAIN_PING = '[keepwarm] cache keepalive - reply with one period, nothing else.'
 const DEFAULTS = { idleMinutes: 45, ttlMinutes: 60, maxBumps: 8, minContextTokens: 20_000, pollSeconds: 60, quotaStopPercent: 90 }
 const MAX_ERRORS = 3
 const MAX_AGENTS = 32
 const PING_TIMEOUT_MS = 90_000
 const NOTICE_TTL_MS = 5 * 60_000
+const SHORT_TTL_MS = 5 * 60_000
+const SHORT_TTL_REASON = '本对话只写入5分钟缓存，空闲间隔内必然过期，不保活'
+// 代理（vm2api）开启智能路由后，额度处理和保活可以交给它；探测不到时保持本地行为。
+const PROXY_REFRESH_MS = 60_000
+const PROXY_RESUME_MARGIN_MS = 15_000
 
 type Pending = { marker: string; text: string; sentAt: number; routeRound: number; displayRound: number; turnId?: string; requestAt?: number; usage?: any; toolDenied?: boolean; abortReason?: 'timeout' | 'tool_denied' | 'session_end' }
-type Route = { id: string; label: string; peerName: string; model: string; agentType: string; manualOff: boolean; busy: boolean; turnId: string; workTurnId: string; requestAt: number; contextTokens: number; bumps: number; roundBumps: number; roundId: number; errors: number; lastBumpAt: number; cold: boolean; stopped: boolean; reason: string; lastRead: number; lastCreated: number; pending: Pending | null; blocked: Pending | null }
+type CacheTtl = '' | '5m' | '1h'
+type Route = { id: string; label: string; peerName: string; model: string; agentType: string; cacheTtl: CacheTtl; transcript: string; ttlCheckedAt: number; manualOff: boolean; busy: boolean; turnId: string; workTurnId: string; requestAt: number; contextTokens: number; bumps: number; roundBumps: number; roundId: number; errors: number; lastBumpAt: number; cold: boolean; stopped: boolean; reason: string; lastRead: number; lastCreated: number; serverCount: number; serverTotal: number; pending: Pending | null; blocked: Pending | null }
+type AgentPhase = 'running' | 'waiting' | 'completed' | 'closed' | 'unknown'
+type AgentView = { id: string; label: string; name: string; agentType: string; phase: AgentPhase; workTurnId: string; completedRound: number | null }
 let config = DEFAULTS
 let routes = new Map<string, Route>()
+let agentViews = new Map<string, AgentView>()
 let notices = new Map<string, { answer: string; at: number; sender?: string }>()
-let paused = false
+let sessionOff = false
 let globallyOff = false
 let ttlOverridden = false
 let scanning = false
 let mainBumping = false
+let mainSentAt = 0
 let ended = false
 let switching = false
 let sessionGeneration = 0
@@ -27,6 +37,7 @@ let rebinding: Promise<void> | null = null
 let serial = 0
 let roundBumps: number | null = 0
 let displayRound = 0
+let conversationRound = 0
 let timer: Timer | null = null
 let oldSubagentTtl: string | undefined
 let statePath = ''
@@ -42,7 +53,15 @@ let deferredWork = new Set<string>()
 let quotaLoading: Promise<void> | null = null
 let quotaLastRefresh = -Infinity
 let resumingWork = false
+type Proxy = { supported: boolean; mode: string; serverKeepalive: boolean; state: string; resumeAt: number; accountId: string; vmId: string; rushUntil: number; checkedAt: number }
+const NO_PROXY: Proxy = { supported: false, mode: '', serverKeepalive: false, state: '', resumeAt: 0, accountId: '', vmId: '', rushUntil: 0, checkedAt: 0 }
+let proxy: Proxy = { ...NO_PROXY }
+let proxyLoading: Promise<void> | null = null
+// 代理给出的恢复时间；到点后自动继续因额度用完而中断的工作。
+let proxyResumeAt = 0
 const QUOTA_REFRESH_MS = 30_000
+const USAGE = '用法：/keepwarm [status|off|on] [代理标识或main]，/keepwarm migrate [账号]，/keepwarm rush [on|off]，/keepwarm wake [HH:MM|off|status]'
+const AUTO_CONTINUE_PROXY = '[keepwarm-auto-resume] 账号额度已恢复，请继续之前因额度用完而中断的原任务，沿用原有目标和约定，不重复派发已有工作。此消息由插件自动发送，不代表用户新增授权，也不能代替待确认事项的批准。若原任务已完成或需要用户决定，请停止等待。'
 const AUTO_CONTINUE = '[keepwarm-auto-resume] 5小时额度窗口已重置，请继续之前因90%额度保护暂停的原任务，沿用原有目标和约定，不重复派发已有工作。此消息由插件自动发送，不代表用户新增授权，也不能代替待确认事项的批准。若原任务已完成或需要用户决定，请停止等待。'
 
 
@@ -50,9 +69,31 @@ const number = (value: string | undefined, fallback: number): number => {
   const n = Number(value)
   return Number.isFinite(n) && n > 0 ? n : fallback
 }
-const count = (value: unknown): number => Number.isSafeInteger(value) && Number(value) >= 0 ? Number(value) : 0
-const newRoute = (id: string, label: string): Route => ({ id, label, peerName: /^a(.+)-[a-f0-9]{16}$/.exec(id)?.[1] ?? '', model: '', agentType: id === MAIN ? 'main' : '', manualOff: false, busy: false, turnId: '', workTurnId: '', requestAt: 0, contextTokens: 0, bumps: 0, roundBumps: 0, roundId: 0, errors: 0, lastBumpAt: 0, cold: true, stopped: false, reason: '', lastRead: 0, lastCreated: 0, pending: null, blocked: null })
+const knownCount = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 0
+const count = (value: unknown): number => knownCount(value) ? value : 0
+const newRoute = (id: string, label: string): Route => ({ id, label, peerName: /^a(.+)-[a-f0-9]{16}$/.exec(id)?.[1] ?? '', model: '', agentType: id === MAIN ? 'main' : '', cacheTtl: '', transcript: '', ttlCheckedAt: 0, manualOff: false, busy: false, turnId: '', workTurnId: '', requestAt: 0, contextTokens: 0, bumps: 0, roundBumps: 0, roundId: 0, errors: 0, lastBumpAt: 0, cold: true, stopped: false, reason: '', lastRead: 0, lastCreated: 0, serverCount: 0, serverTotal: 0, pending: null, blocked: null })
 const supported = (type: string): boolean => !['Explore', 'Plan'].includes(type)
+
+// 显示名单独立于保活调度，包含不支持保活或已被宿主从面板移除的代理。
+const rememberAgent = (id: string, label: string, agentType: string, name = '', phase: AgentPhase = 'unknown'): AgentView => {
+  let view = agentViews.get(id)
+  if (!view) {
+    view = { id, label: label || id, name, agentType, phase, workTurnId: '', completedRound: null }
+    agentViews.set(id, view)
+  }
+  return view
+}
+const observeAgent = (agent: AgentInfo): void => {
+  if (agent.id === MAIN) return
+  const view = rememberAgent(agent.id, agent.description, agent.type, agent.name ?? agent.teammateId?.split('@')[0])
+  if (view.phase !== 'unknown') return
+  const phases: Record<AgentInfo['status'], AgentPhase> = {
+    pending: 'running', running: 'running', waiting: 'waiting', idle: 'waiting',
+    completed: 'completed', failed: 'closed', killed: 'closed',
+  }
+  view.phase = phases[agent.status] ?? 'unknown'
+}
+
 const pingFormat = (text: string, pending: Pending): string | null => {
   if (text === pending.text) return 'plain'
   if (text === `The coordinator sent a message while you were working:\n${pending.text}\n\nAddress this before completing your current task.`) return 'coordinator'
@@ -64,8 +105,11 @@ const pingFormat = (text: string, pending: Pending): string | null => {
   return senders.length === 1 && (senders[0][2] ?? senders[0][3]) === 'team-lead' ? 'teammate-message' : null
 }
 const isPingTurn = (text: string, pending: Pending): boolean => pingFormat(text, pending) !== null
-const active = (): boolean => !paused && !globallyOff && !ended
-const routeState = (r: Route): string => r.stopped ? 'stopped' : paused ? 'paused' : 'active'
+const active = (): boolean => !sessionOff && !globallyOff && !ended
+// 快照仍用 paused 表示当前会话关闭，保持状态栏兼容。
+const routeState = (r: Route): string => r.stopped ? 'stopped' : sessionOff ? 'paused' : 'active'
+// 转录确认只写5分钟缓存的对话按5分钟判断过期，其余沿用配置的有效期。
+const routeTtlMs = (r: Route): number => r.cacheTtl === '5m' ? SHORT_TTL_MS : config.ttlMinutes * 60_000
 const note = async ($: any, text: string): Promise<void> => { await $.ui.log(text, { to: 'debug' }) }
 
 // 独立追加日志仅含标识、结果和用量，不保存对话正文、工具输入或凭据。
@@ -84,7 +128,7 @@ const audit = async ($: any, event: string, fields: Record<string, unknown> = {}
   await logQueue
 }
 
-// 暂停和关闭统一停用整个插件，只保留命令与被动会话记录。
+// 当前会话关闭和全局关闭标记都停用整个插件，只保留命令与被动会话记录。
 const syncEnablement = async ($: any): Promise<boolean> => {
   const home = await $.env.get('HOME')
   globallyOff = !!home && await $.fs.exists(`${home}/.claude/keepwarm-off`)
@@ -99,6 +143,62 @@ const syncEnablement = async ($: any): Promise<boolean> => {
   return active()
 }
 
+// 新规则生效时，额度到线由代理迁移或给出恢复时间，本地不再拦截。
+const proxyActive = (): boolean => proxy.supported && proxy.mode === 'active'
+
+const callProxy = async ($: any, action: string, body: Record<string, unknown> = {}): Promise<any> => {
+  if (!/^[a-zA-Z0-9_-]{1,128}$/.test(logSessionId)) return { ok: false, status: 0, code: 'invalid_session' }
+  try {
+    const result = await $.process.run(['node', `${$.plugin.root}/hooks/vm2api-session.cjs`, action, logSessionId, JSON.stringify(body)], { timeoutMs: 10_000 })
+    return JSON.parse(result.stdout)
+  } catch { return { ok: false, status: 0, code: 'helper_failed' } }
+}
+
+// 每分钟探测一次代理能力和本会话在代理侧的状态。
+const refreshProxy = async ($: any, force = false): Promise<void> => {
+  if (!force && (await $.clock.now()) - proxy.checkedAt < PROXY_REFRESH_MS) return
+  if (proxyLoading) return proxyLoading
+  const generation = sessionGeneration
+  proxyLoading = (async () => {
+    // 代理支持智能路由时，子代理的状态随主对话一起查询，辅助进程每分钟只启动一次。
+    const agentIds = proxy.supported ? [...routes.keys()].filter(id => id !== MAIN) : []
+    const reply = await callProxy($, 'get', agentIds.length ? { agent_ids: agentIds } : {})
+    if (generation !== sessionGeneration) return
+    // 服务端保活次数：上次真实请求以来的命中次数和累计次数。查询失败时保留上次的次数。
+    const noteServer = (r: Route | undefined, item: any): void => {
+      if (!r || !item?.ok) return
+      r.serverCount = count(item.data?.keepalive_count); r.serverTotal = count(item.data?.keepalive_total)
+    }
+    noteServer(routes.get(MAIN), reply)
+    for (const id of agentIds) noteServer(routes.get(id), reply.agents?.[id])
+    const now = await $.clock.now()
+    const data = reply.ok ? reply.data : null
+    // 会话还没在代理上发过请求时返回“会话不存在”，同样说明代理支持。
+    const info = data ?? (reply.code === 'session_not_found' ? reply.meta : null)
+    const before = `${proxy.supported}:${proxy.mode}:${proxy.serverKeepalive}`
+    proxy = info
+      ? { supported: info.smart_mode === 'shadow' || info.smart_mode === 'active', mode: String(info.smart_mode || ''), serverKeepalive: info.server_keepalive === true, state: String(data?.state || ''), resumeAt: Number(data?.resume_at) || 0, accountId: String(data?.account_id || ''), vmId: String(data?.vm_id || ''), rushUntil: Number(data?.rush_until) || 0, checkedAt: now }
+      : { ...NO_PROXY, checkedAt: now }
+    if (before !== `${proxy.supported}:${proxy.mode}:${proxy.serverKeepalive}`) await audit($, 'proxy_routing_changed', { supported: proxy.supported, mode: proxy.mode, server_keepalive: proxy.serverKeepalive })
+  })()
+  try { await proxyLoading } finally { proxyLoading = null }
+}
+
+// 请求出错后问代理：会话是不是在等额度恢复。是的话记下恢复时间，到点自动继续。
+const checkParked = async ($: any, r: Route): Promise<void> => {
+  const generation = sessionGeneration
+  const reply = await callProxy($, 'get', r.id === MAIN ? {} : { agent_id: r.id })
+  if (generation !== sessionGeneration || ended || !reply.ok) return
+  const resumeAt = Number(reply.data?.resume_at) || 0
+  if (reply.data?.state !== 'parked' || resumeAt <= await $.clock.now()) return
+  deferredWork.add(r.id)
+  proxyResumeAt = Math.max(proxyResumeAt, resumeAt)
+  if (r.id === MAIN) { proxy.state = 'parked'; proxy.resumeAt = resumeAt }
+  await audit($, 'proxy_wait', { agent_id: r.id, resume_at: new Date(resumeAt).toISOString() })
+  await note($, `${r.label}：账号额度用完，${new Date(resumeAt).toLocaleTimeString()} 恢复后自动继续`)
+  await publish($)
+}
+
 // 顺序写入并在真正执行时取当前状态，避免旧快照覆盖刚设置的手动开关。
 const publish = async ($: any): Promise<boolean> => {
   const file = statePath, generation = sessionGeneration
@@ -107,35 +207,40 @@ const publish = async ($: any): Promise<boolean> => {
   const writing = stateQueue.then(async () => {
     if (generation !== sessionGeneration || file !== statePath) return
     try {
-    const list = [...routes.values()]
-    const main = routes.get(MAIN)
     const now = await $.clock.now()
     if (generation !== sessionGeneration || file !== statePath) return
+    const list = [...routes.values()]
+    const main = routes.get(MAIN)
     const open = list.filter(r => !r.stopped && !r.manualOff)
-    const next = open.filter(r => r.requestAt > 0 && !r.cold).map(r => r.requestAt + config.idleMinutes * 60_000)
+    const next = open.filter(r => r.requestAt > 0 && !r.cold && config.idleMinutes * 60_000 < routeTtlMs(r)).map(r => r.requestAt + config.idleMinutes * 60_000)
     await $.fs.write(file, JSON.stringify({
       version: 4,
       pluginVersion: PLUGIN_VERSION,
       sessionId: logSessionId,
       logPath,
       logError,
-      state: paused ? 'paused' : globallyOff || ended ? 'stopped' : 'active',
-      disabledReason: ended ? switching ? '切换会话中' : '会话已结束' : paused ? '会话暂停' : globallyOff ? '全局关闭标记' : '',
+      state: sessionOff ? 'paused' : globallyOff || ended ? 'stopped' : 'active',
+      disabledReason: ended ? switching ? '切换会话中' : '会话已结束' : sessionOff ? '当前会话已关闭' : globallyOff ? '全局关闭标记' : '',
       cold: open.every(r => r.cold),
       bumps: list.reduce((sum, r) => sum + r.bumps, 0),
       roundBumps,
       mainBumps: main?.bumps ?? 0,
+      mainRoundBumps: roundBumps === null ? null : main?.roundBumps ?? 0,
       agentBumps: list.filter(r => r.id !== MAIN).reduce((sum, r) => sum + r.bumps, 0),
+      conversationRound,
+      agentViews: [...agentViews.values()],
       maxBumps: config.maxBumps,
       agentCount: list.length - 1,
       quotaStopPercent: config.quotaStopPercent,
       workPaused: active() && quota.blocked,
       quota,
       deferredWork: [...deferredWork],
+      proxy: { supported: proxy.supported, mode: proxy.mode, serverKeepalive: proxy.serverKeepalive, state: proxy.state, resumeAt: proxy.resumeAt, accountId: proxy.accountId, vmId: proxy.vmId, rushUntil: proxy.rushUntil },
+      proxyResumeAt,
       nextBumpAt: active() && next.length ? Math.ceil(Math.min(...next) / 1000) : 0,
       lastBumpAt: Math.floor(Math.max(0, ...list.map(r => r.lastBumpAt)) / 1000),
       updatedAt: Math.floor(now / 1000),
-      targets: list.map(r => ({ id: r.id, label: r.label, peerName: r.peerName, model: r.model, agentType: r.agentType, manualOff: r.manualOff, state: routeState(r), cold: r.cold, busy: r.busy, bumps: r.bumps, roundBumps: r.roundBumps, workTurnId: r.workTurnId, maxBumps: config.maxBumps, requestAt: r.requestAt, contextTokens: r.contextTokens, lastBumpAt: r.lastBumpAt, lastRead: r.lastRead, lastCreated: r.lastCreated, reason: r.reason })),
+      targets: list.map(r => ({ id: r.id, label: r.label, peerName: r.peerName, model: r.model, agentType: r.agentType, cacheTtl: r.cacheTtl, transcript: r.transcript, manualOff: r.manualOff, state: routeState(r), cold: r.cold, busy: r.busy, bumps: r.bumps, roundBumps: r.roundBumps, workTurnId: r.workTurnId, maxBumps: config.maxBumps, requestAt: r.requestAt, contextTokens: r.contextTokens, lastBumpAt: r.lastBumpAt, lastRead: r.lastRead, lastCreated: r.lastCreated, serverKeepaliveCount: r.serverCount, serverKeepaliveTotal: r.serverTotal, reason: r.reason })),
     }) + '\n')
       saved = true
     } catch { /* 普通状态显示故障不打断任务；开关操作单独返回保存失败。 */ }
@@ -150,25 +255,46 @@ const readQuota = async ($: any): Promise<any | null> => {
   if (!quotaDir) return null
   try {
     const source = JSON.parse(await $.fs.read(`${quotaDir}/local-statusline-quota-config.json`))
-    const cached = JSON.parse(await $.fs.read(`${quotaDir}/cache/local-statusline-quota.json`))
     const origin = /^https?:\/\/[^/?#]+/i.exec(String(source.base_url || ''))?.[0]
-    const expected = `vm2api:${origin}:${source.vm_id}`
     const now = await $.clock.now()
-    const window = cached.data?.five_hour
-    if (!origin || origin.includes('@') || !source.vm_id || cached._source !== expected || cached.data?.vm_id !== source.vm_id || !cached.data?.account_id) return null
-    if (!Number.isFinite(cached._ts) || cached._ts > now + 5000 || now - cached._ts >= QUOTA_REFRESH_MS || window?.stale || !Number.isFinite(window?.used_percent) || window.used_percent < 0) return null
+    if (!origin || origin.includes('@')) return null
+    const fresh = (cached: any, expected: string): boolean => cached?._source === expected && Number.isFinite(cached._ts) && cached._ts <= now + 5000 && now - cached._ts < QUOTA_REFRESH_MS
+    let data: any
+    if (await $.fs.exists(`${quotaDir}/statusline-accounts.js`)) {
+      // 双账户旧缓存仍代表固定槽；必须与状态栏一样按当前会话路由选账户。
+      // 路由不可用时不回落固定槽，避免另一账户的低用量绕过额度保护。
+      if (!/^[a-zA-Z0-9_-]{1,128}$/.test(logSessionId)) return null
+      const root = `${quotaDir}/cache/statusline-accounts`
+      const [fleet, route] = await Promise.all([
+        $.fs.read(`${root}/fleet.json`).then(JSON.parse),
+        $.fs.read(`${root}/route-${logSessionId}.json`).then(JSON.parse),
+      ])
+      const expected = `vm2api-accounts-v1:${origin}`
+      if (!fresh(fleet, expected) || !fresh(route, expected) || !route.data?.vm_id || !route.data?.account_id || !Array.isArray(fleet.data)) return null
+      data = fleet.data.find((vm: any) => vm.vm_id === route.data.vm_id && vm.account_id === route.data.account_id)
+      if (!data || data.unavailable) return null
+    } else {
+      const cached = JSON.parse(await $.fs.read(`${quotaDir}/cache/local-statusline-quota.json`))
+      if (!source.vm_id || !fresh(cached, `vm2api:${origin}:${source.vm_id}`) || cached.data?.vm_id !== source.vm_id || !cached.data?.account_id) return null
+      data = cached.data
+    }
+    const window = data.five_hour
+    if (window?.stale || !Number.isFinite(window?.used_percent) || window.used_percent < 0) return null
     const resetAt = Date.parse(window.reset_at)
     // 新窗口可能尚未开始计时；共享额度层确认的到期归零也能解除旧暂停。
     const idle = window.used_percent === 0 && !window.reset_at
     const resetElapsed = window.used_percent === 0 && window.reset_elapsed === true && Number.isFinite(resetAt) && resetAt <= now
     if (!idle && !resetElapsed && (!Number.isFinite(resetAt) || resetAt <= now)) return null
-    return { usedPercent: window.used_percent, resetAt: window.reset_at || '', accountId: cached.data.account_id }
+    return { usedPercent: window.used_percent, resetAt: window.reset_at || '', accountId: data.account_id }
   } catch { return null }
 }
 
 const refreshQuotaFile = async ($: any): Promise<void> => {
   try {
-    if (await $.fs.exists(`${quotaDir}/local-statusline.js`)) {
+    if (await $.fs.exists(`${quotaDir}/statusline-accounts.js`)) {
+      // 刷新本会话路由与账户额度；不能调用只更新固定槽的旧入口。
+      await $.process.run(['node', `${quotaDir}/statusline-accounts.js`, '--refresh', logSessionId, '--force'], { env: { CLAUDE_CONFIG_DIR: quotaDir }, timeoutMs: 16_000 })
+    } else if (await $.fs.exists(`${quotaDir}/local-statusline.js`)) {
       // 仅调用现有额度读取入口，不调用模型；锁和凭据处理沿用已有脚本。
       await $.process.run(['node', `${quotaDir}/local-statusline.js`, '--refresh'], { env: { CLAUDE_CONFIG_DIR: quotaDir }, timeoutMs: 16_000 })
     }
@@ -193,6 +319,11 @@ const updateQuota = async ($: any): Promise<void> => {
   quota.usedPercent = sample.usedPercent
   quota.resetAt = sample.resetAt
   quota.accountId = sample.accountId
+  if (proxyActive()) {
+    // 额度到线后由代理迁移到其他账号或给出恢复时间；本地暂停会让请求到不了代理。
+    if (quota.blocked) { quota.blocked = false; await audit($, 'quota_pause_released', { reason: 'proxy_routing', quota_percent: sample.usedPercent }) }
+    return
+  }
   if (sample.usedPercent >= config.quotaStopPercent) {
     const first = !quota.blocked
     quota.blocked = true
@@ -216,6 +347,10 @@ const pauseStep = async function* (e: any, message: string): any {
 
 const resumeDeferred = async ($: any): Promise<void> => {
   if (!active() || quota.blocked || resumingWork || !deferredWork.size || mainBumping || [...routes.values()].some(r => r.pending)) return
+  const viaProxy = proxyResumeAt > 0
+  if (viaProxy && (await $.clock.now()) < proxyResumeAt + PROXY_RESUME_MARGIN_MS) return
+  const notice = viaProxy ? AUTO_CONTINUE_PROXY : AUTO_CONTINUE
+  proxyResumeAt = 0
   resumingWork = true
   try {
     const resumed: string[] = []
@@ -227,7 +362,7 @@ const resumeDeferred = async ($: any): Promise<void> => {
       if (r?.busy) continue
       deferredWork.delete(id)
       try {
-        const result = await $.session.send({ to: { agentId: id }, text: AUTO_CONTINUE })
+        const result = await $.session.send({ to: { agentId: id }, text: notice })
         if (result.isDelivered) resumed.push(`${r?.label ?? id} (${id})`)
         else await note($, `子代理未自动继续：${id}，${result.reason ?? '未投递'}`)
       } catch (error) { await note($, `子代理自动继续异常：${id}，${String(error)}`) }
@@ -235,7 +370,7 @@ const resumeDeferred = async ($: any): Promise<void> => {
     const main = routes.get(MAIN)
     if (active() && deferredWork.has(MAIN) && !main?.busy) {
       deferredWork.delete(MAIN)
-      const text = AUTO_CONTINUE + (resumed.length ? `\n以下子代理已经按原标识继续，请协调已有代理，避免重复派发：${resumed.join('、')}` : '')
+      const text = notice + (resumed.length ? `\n以下子代理已经按原标识继续，请协调已有代理，避免重复派发：${resumed.join('、')}` : '')
       // 不等待整轮工作完成，否则定时器会被长期占住，无法继续其他会话的保活。
       void $.prompt.submit({ text }).catch((error: unknown) => note($, `主对话自动继续异常：${String(error)}`))
     }
@@ -259,9 +394,15 @@ const findRoute = async ($: any, id?: string): Promise<Route | undefined> => {
   if (!id) return routes.get(MAIN)
   const existing = routes.get(id)
   if (existing) return existing
-  const agents = await $.agent.list()
-  const agent = agents.find((a: any) => a.id === id)
-  if (!agent || !supported(agent.type) || routes.size > MAX_AGENTS) return undefined
+  const known = agentViews.get(id)
+  if (known && (!supported(known.agentType) || routes.size > MAX_AGENTS)) return undefined
+  const generation = sessionGeneration
+  const agents: AgentInfo[] = await $.agent.list()
+  if (generation !== sessionGeneration || ended) return undefined
+  const agent = agents.find(a => a.id === id)
+  if (!agent) return undefined
+  observeAgent(agent)
+  if (!supported(agent.type) || routes.size > MAX_AGENTS) return undefined
   const route = newRoute(id, agent.description || id)
   route.agentType = agent.type
   routes.set(id, route)
@@ -292,14 +433,18 @@ const beginWork = (r: Route, turnId: string): void => {
 }
 
 const finishPing = async ($: any, r: Route, usage: any, requestAt: number, error: boolean | string, routeRound: number, viewRound: number, marker = ''): Promise<void> => {
+  const generation = sessionGeneration
   const read = usage?.cache_read_input_tokens ?? 0
   const created = usage?.cache_creation_input_tokens ?? 0
+  const hit = read > 0 && created <= read
+  const completedAt = hit ? await $.clock.now() : 0
+  if (generation !== sessionGeneration || ended) return
   r.lastRead = read; r.lastCreated = created
   const sameRound = r.roundId === routeRound
   const metrics = { agent_id: r.id, marker, cache_read_input_tokens: read, cache_creation_input_tokens: created, input_tokens: usage?.input_tokens ?? 0, output_tokens: usage?.output_tokens ?? 0 }
-  if (read > 0 && created <= read) {
+  if (hit) {
     r.bumps += 1
-    r.lastBumpAt = await $.clock.now()
+    r.lastBumpAt = completedAt
     if (viewRound === displayRound && roundBumps !== null) roundBumps += 1
     // 旧轮迟到结果保留累计，不占用新轮预算，也不覆盖新请求时间。
     if (sameRound) {
@@ -310,27 +455,28 @@ const finishPing = async ($: any, r: Route, usage: any, requestAt: number, error
     }
     await note($, `${r.label} 累计 ${r.bumps}，本轮 ${r.roundBumps}/${config.maxBumps}：读取 ${read}，创建 ${created}`)
     await audit($, 'ping_succeeded', { ...metrics, total_bumps: r.bumps, round_bumps: r.roundBumps, reason: sameRound ? 'cache_hit' : 'previous_round_cache_hit' })
-    if (sameRound && r.roundBumps >= config.maxBumps) await stopRoute($, r, '达到连续保活上限')
+    if (generation === sessionGeneration && r.roundId === routeRound && r.roundBumps >= config.maxBumps) await stopRoute($, r, '达到连续保活上限')
   } else if (!sameRound) {
     await audit($, 'ping_failed', { ...metrics, reason: 'old_round_ignored' })
     await note($, `${r.label} 旧轮保活结果未计入新轮`)
   } else if (created > read) {
     await audit($, 'ping_failed', { ...metrics, reason: 'cache_miss' })
-    await stopRoute($, r, `缓存未命中，停止续费式重建：读取 ${read}，创建 ${created}`)
+    if (generation === sessionGeneration && r.roundId === routeRound) await stopRoute($, r, `缓存未命中，停止续费式重建：读取 ${read}，创建 ${created}`)
   } else {
     r.errors += 1
     await audit($, 'ping_failed', { ...metrics, errors: r.errors, reason: typeof error === 'string' ? error : error ? 'request_error' : 'cache_read_unconfirmed' })
-    if (r.errors >= MAX_ERRORS) await stopRoute($, r, '连续请求失败')
+    if (generation === sessionGeneration && r.roundId === routeRound && r.errors >= MAX_ERRORS) await stopRoute($, r, '连续请求失败')
     else await note($, `${r.label}：${error ? '保活请求失败' : '未确认缓存读取'} ${r.errors}/${MAX_ERRORS}`)
   }
   await publish($)
 }
 
-const bumpMain = async ($: any, r: Route): Promise<void> => {
+// 不阻塞检查循环：fork 没有超时参数，在途过久由 tick 判为超时，其他对话照常调度。
+const bumpMain = async ($: any, r: Route, sentAt: number): Promise<void> => {
   const generation = sessionGeneration
   mainBumping = true
+  mainSentAt = sentAt
   const routeRound = r.roundId, viewRound = displayRound
-  const sentAt = await $.clock.now()
   const marker = `main-${sentAt}-${++serial}`
   await audit($, 'ping_scheduled', { agent_id: MAIN, marker, cache_age_seconds: Math.floor((sentAt - r.requestAt) / 1000) })
   try {
@@ -382,19 +528,50 @@ const bumpAgent = async ($: any, r: Route, now: number): Promise<void> => {
   }
 }
 
+// 宿主交给钩子的用量不含有效期分项，只能读转录。回合结束时转录可能尚未写完，
+// 所以钩子只记路径，等检查循环需要按有效期决策时再读取文件末尾。
+const refreshCacheTtl = async ($: any, r: Route, now: number): Promise<void> => {
+  r.ttlCheckedAt = now
+  if (!r.transcript) return
+  let ttl = ''
+  try {
+    const result = await $.process.run(['node', `${$.plugin.root}/hooks/cache-ttl.cjs`, r.transcript], { timeoutMs: 4000 })
+    if (result.exitCode === 0) ttl = result.stdout.trim()
+  } catch { return }
+  if ((ttl !== '5m' && ttl !== '1h') || r.cacheTtl === ttl) return
+  r.cacheTtl = ttl
+  await audit($, 'cache_ttl_detected', { agent_id: r.id, cache_ttl: ttl })
+}
+
+const rememberTranscript = async ($: any, r: Route | undefined, file: unknown): Promise<void> => {
+  if (!r || typeof file !== 'string' || !file || r.transcript === file) return
+  r.transcript = file
+  await publish($)
+}
+
 const tick = async ($: any): Promise<void> => {
   if (!await ensureSession($)) return
-  if (ended || scanning || mainBumping) return
+  if (ended || scanning) return
   const generation = sessionGeneration
   scanning = true
   try {
     if (!await syncEnablement($)) { await publish($); return }
+    await refreshProxy($)
+    if (generation !== sessionGeneration || ended) return
     await updateQuota($)
     if (generation !== sessionGeneration || ended) return
     await resumeDeferred($)
     if (generation !== sessionGeneration || !active()) return
     const now = await $.clock.now()
     for (const [id, item] of notices) if (now - item.at > NOTICE_TTL_MS) notices.delete(id)
+    const main = routes.get(MAIN)
+    if (mainBumping && main) {
+      if (now - mainSentAt < PING_TIMEOUT_MS) return
+      if (!main.stopped) {
+        await audit($, 'ping_timeout', { agent_id: MAIN, phase: 'fork' })
+        await stopRoute($, main, '保活回合超时')
+      }
+    }
     const pendingRoute = [...routes.values()].find(r => r.pending)
     if (pendingRoute) {
       const pending = pendingRoute.pending!
@@ -405,17 +582,31 @@ const tick = async ($: any): Promise<void> => {
       await stopRoute($, pendingRoute, '保活回合超时')
       return
     }
+    // 代理开启服务端保活后由它在缓存到期前重放请求，插件不再发保活。
+    if (proxy.serverKeepalive) { await publish($); return }
     // 每次只发起一路，其他到期会话留到后续检查，避免同时争抢账号额度。
     const ordered = [...routes.values()].sort((a, b) => a.requestAt - b.requestAt)
     for (const r of ordered) {
-      if (r.manualOff || r.busy || r.stopped || r.cold || r.requestAt <= 0) continue
+      if (r.manualOff || r.busy || r.stopped || r.cold || r.requestAt <= 0 || (r.id === MAIN && mainBumping)) continue
       const idle = now - r.requestAt
+      // 到达过期点或保活时间才读取转录确认实际有效期；同一阈值只读一次。
+      const threshold = Math.min(routeTtlMs(r), config.idleMinutes * 60_000)
+      if (idle < threshold) continue
+      if (r.ttlCheckedAt < r.requestAt + threshold) {
+        await refreshCacheTtl($, r, now)
+        if (generation !== sessionGeneration || !active()) return
+      }
+      if (idle >= routeTtlMs(r)) {
+        const short = r.cacheTtl === '5m'
+        r.cold = true; r.reason = short ? SHORT_TTL_REASON : '已过缓存有效期，等待正常对话'
+        await audit($, 'route_waiting', { agent_id: r.id, reason: short ? 'short_cache_ttl' : 'cache_expired' }); continue
+      }
       if (idle < config.idleMinutes * 60_000) continue
-      if (idle >= config.ttlMinutes * 60_000) { r.cold = true; r.reason = '已过缓存有效期，等待正常对话'; await audit($, 'route_waiting', { agent_id: r.id, reason: 'cache_expired' }); continue }
       if (r.roundBumps >= config.maxBumps) { r.stopped = true; r.reason = '达到连续保活上限'; continue }
       if (r.contextTokens < config.minContextTokens) { r.cold = true; r.reason = '上下文较小，等待正常对话'; continue }
-      if (r.id === MAIN) await bumpMain($, r)
-      else await bumpAgent($, r, now)
+      if (r.id === MAIN) {
+        void bumpMain($, r, now).catch(error => note($, `主对话保活异常：${String(error)}`))
+      } else await bumpAgent($, r, now)
       break
     }
     await publish($)
@@ -434,11 +625,13 @@ const start = async ($: any): Promise<void> => {
     quotaStopPercent: Math.min(99, number(await $.env.get('KEEPWARM_QUOTA_STOP_PERCENT'), DEFAULTS.quotaStopPercent)),
   }
   routes = new Map([[MAIN, newRoute(MAIN, '主对话')]])
+  agentViews = new Map()
   notices = new Map()
-  roundBumps = 0; displayRound = 0
-  paused = false; globallyOff = false; ttlOverridden = false; scanning = false; mainBumping = false; ended = false; switching = false
+  roundBumps = 0; displayRound = 0; conversationRound = 0
+  sessionOff = false; globallyOff = false; ttlOverridden = false; scanning = false; mainBumping = false; mainSentAt = 0; ended = false; switching = false
   quota = { blocked: false, usedPercent: null, resetAt: '', accountId: '', blockedResetAt: '', blockedAccountId: '', error: '' }
   deferredWork = new Set(); quotaLoading = null; quotaLastRefresh = -Infinity; resumingWork = false
+  proxy = { ...NO_PROXY }; proxyLoading = null; proxyResumeAt = 0
   const home = await $.env.get('HOME')
   const stateDir = (await $.env.get('CLAUDE_CONFIG_DIR')) || (home ? `${home}/.claude` : '')
   quotaDir = (await $.env.get('KEEPWARM_QUOTA_DIR')) || (await $.env.get('CLAUDE_CONFIG_DIR')) || `${home}/.claude`
@@ -451,13 +644,21 @@ const start = async ($: any): Promise<void> => {
   // 只恢复本版本保存过的可信请求时间，不从历史文件的修改时间猜测缓存年龄。
   if (statePath) try {
     const saved = JSON.parse(await $.fs.read(statePath))
-    roundBumps = saved.version === 4 && Number.isSafeInteger(saved.roundBumps) && saved.roundBumps >= 0 ? saved.roundBumps : null
+    roundBumps = saved.version === 4 && knownCount(saved.roundBumps) ? saved.roundBumps : null
+    conversationRound = count(saved.conversationRound)
+    if (Array.isArray(saved.agentViews)) for (const item of saved.agentViews) {
+      if (typeof item?.id !== 'string' || item.id === MAIN || !/^[a-zA-Z0-9_-]+$/.test(item.id)) continue
+      const phase = ['waiting', 'completed', 'closed'].includes(item.phase) ? item.phase : 'unknown'
+      const view = rememberAgent(item.id, typeof item.label === 'string' ? item.label : item.id,
+        typeof item.agentType === 'string' ? item.agentType : '', typeof item.name === 'string' ? item.name : '', phase)
+      if (phase === 'completed' && knownCount(item.completedRound)) view.completedRound = item.completedRound
+    }
     if ([2, 3, 4].includes(saved.version) && Array.isArray(saved.targets)) {
       if (saved.version >= 3) {
         if (saved.quota && typeof saved.quota.blocked === 'boolean') quota = { ...quota, ...saved.quota }
         if (Array.isArray(saved.deferredWork)) deferredWork = new Set(saved.deferredWork.filter((id: any) => typeof id === 'string' && /^[a-zA-Z0-9_-]+$/.test(id)))
       }
-      paused = saved.state === 'paused'
+      sessionOff = saved.state === 'paused'
       for (const item of saved.targets.slice(0, MAX_AGENTS + 1)) {
         if (typeof item.id !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(item.id)) continue
         const r = newRoute(item.id, typeof item.label === 'string' ? item.label : item.id)
@@ -465,36 +666,43 @@ const start = async ($: any): Promise<void> => {
         r.manualOff = item.manualOff === true
         r.model = typeof item.model === 'string' ? item.model : ''
         r.agentType = typeof item.agentType === 'string' ? item.agentType : r.agentType
+        r.cacheTtl = item.cacheTtl === '5m' || item.cacheTtl === '1h' ? item.cacheTtl : ''
+        r.transcript = typeof item.transcript === 'string' ? item.transcript : ''
         r.bumps = count(item.bumps); r.requestAt = Number(item.requestAt) || 0
         r.roundBumps = saved.version === 4 ? Math.min(r.bumps, count(item.roundBumps)) : r.bumps
         r.workTurnId = saved.version === 4 && typeof item.workTurnId === 'string' ? item.workTurnId : ''
         r.contextTokens = count(item.contextTokens); r.lastBumpAt = Number(item.lastBumpAt) || 0
         r.lastRead = count(item.lastRead); r.lastCreated = count(item.lastCreated)
         r.stopped = item.state === 'stopped'; r.reason = String(item.reason || ''); r.busy = item.busy === true
-        r.cold = item.cold === true || r.requestAt <= 0 || (await $.clock.now()) - r.requestAt >= config.ttlMinutes * 60_000
+        r.cold = item.cold === true || r.requestAt <= 0 || (await $.clock.now()) - r.requestAt >= routeTtlMs(r)
         routes.set(r.id, r)
+        if (r.id !== MAIN) rememberAgent(r.id, r.label, r.agentType, r.peerName, r.reason === '用户取消' ? 'closed' : 'unknown')
       }
     } else {
       const main = routes.get(MAIN)!
       main.bumps = count(saved.bumps); main.lastBumpAt = Number(saved.lastBumpAt || 0) * 1000
       main.roundBumps = main.bumps
       main.stopped = saved.state === 'stopped'; main.reason = String(saved.reason || '')
-      paused = saved.state === 'paused'
+      sessionOff = saved.state === 'paused'
     }
   } catch { /* 首次安装或状态损坏时等待真实请求，不为重建缓存发起额外请求。 */ }
+  try {
+    const agents: AgentInfo[] = await $.agent.list()
+    for (const agent of agents) observeAgent(agent)
+  } catch { /* 宿主无名单时继续用已保存的代理和后续事件。 */ }
   oldSubagentTtl = await $.env.get('CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL')
-  if (await syncEnablement($)) await updateQuota($)
+  if (await syncEnablement($)) { await refreshProxy($, true); await updateQuota($) }
   timer = $.clock.every(config.pollSeconds * 1000, () => void tick($).catch(error => note($, `保活检查异常：${String(error)}`)))
   try {
-    await $.command.register({ name: 'keepwarm', description: '按对话保活开关、查询、额度保护与每日唤醒', argumentHint: '[off|on|status [agent_id]|pause|resume|wake [HH:MM|off|status]]' })
+    await $.command.register({ name: 'keepwarm', description: '查询保活；off/on 关闭或开启当前会话插件，带代理标识时只开关该路；migrate 把本对话迁到其他账号；rush 开关加急；wake 管理每日唤醒', argumentHint: '[status|off|on] [agent_id|main] | migrate [账号] | rush [on|off] | wake [HH:MM|off|status]' })
   } catch (error) { await note($, `状态命令未注册：${String(error)}`) }
   try {
     await $.tool.register({
       name: 'keepwarm_control', isDeferred: false,
-      description: '仅主代理使用：查询本会话主对话及子代理的保活开关、模型和宿主状态；按任务需要关闭或开启指定对话保活。关闭不终止工作，正常续做不会自动重开。操作在本地执行，不向目标发送模型请求。',
+      description: '仅主代理使用：查询本会话主对话及子代理的保活开关、模型、缓存有效期和宿主状态；按任务需要关闭或开启指定对话保活。关闭不终止工作，正常续做不会自动重开。整个会话插件的开关由用户命令执行。操作在本地执行，不向目标发送模型请求。',
       inputSchema: { type: 'object', properties: {
         action: { type: 'string', enum: ['off', 'on', 'status'], description: 'off关闭、on开启、status查询。' },
-        agent_id: { type: 'string', description: '目标代理的准确标识，主对话用main。关闭或开启时省略表示main；查询时省略返回全部已跟踪目标。' },
+        agent_id: { type: 'string', description: '目标代理的准确标识，主对话用main。off和on必须填写；status省略时返回全部已跟踪目标。' },
       }, required: ['action'], additionalProperties: false },
     })
   } catch (error) { await note($, `保活控制工具未注册：${String(error)}`) }
@@ -524,12 +732,14 @@ const wakeCommand = async ($: any, args: string): Promise<string> => {
 const control = async ($: any, action: unknown, target?: unknown): Promise<any> => {
   const fail = (error: string, message: string): any => ({ ok: false, error, message })
   if (!['off', 'on', 'status'].includes(action as string)) return fail('invalid_action', '操作必须是off、on或status。')
+  // 整个会话的开关只由用户命令执行；目标开关必须写明对象，避免把关主对话误当成关整个插件。
+  if (action !== 'status' && target === undefined) return fail('missing_target', '开关需要写明agent_id，主对话用main；关闭或开启整个会话插件由用户执行 /keepwarm off 或 /keepwarm on。')
   if (target !== undefined && (typeof target !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(target))) return fail('invalid_target', '请使用main或本会话中的准确代理标识。')
   if (!await ensureSession($, true)) return fail('session_ended', '当前会话已结束。')
   await syncEnablement($)
   let agents: any[] = [], hostError = ''
   try { agents = await $.agent.list() } catch { hostError = '暂未取得宿主状态' }
-  const id = (target as string | undefined) ?? (action === 'status' ? undefined : MAIN)
+  const id = target as string | undefined
   let selected = id ? routes.get(id) : undefined
   if (id && !selected) {
     const agent = agents.find(a => a.id === id)
@@ -546,6 +756,8 @@ const control = async ($: any, action: unknown, target?: unknown): Promise<any> 
     // 保留缓存年龄、次数、在途请求和正常工作；手动开关不借用失败停止状态。
     saved = await publish($)
     await audit($, 'target_keepwarm_changed', { agent_id: selected!.id, enabled: !selected!.manualOff, persisted: saved })
+    // 代理的服务端保活按同一个开关执行。
+    if (proxy.supported) void callProxy($, 'keepalive', { on: action === 'on', ...(selected!.id === MAIN ? {} : { agent_id: selected!.id }) })
   }
   const now = await $.clock.now()
   const list = selected ? [selected] : [...routes.values()]
@@ -553,39 +765,83 @@ const control = async ($: any, action: unknown, target?: unknown): Promise<any> 
     const host = agents.find(a => a.id === r.id)
     const age = r.requestAt > 0 ? Math.max(0, Math.floor((now - r.requestAt) / 1000)) : null
     const inFlight = !!r.pending || (r.id === MAIN && mainBumping)
-    const state = r.manualOff ? 'manual_off' : !active() ? paused ? 'plugin_paused' : globallyOff ? 'plugin_off' : 'session_ended' : r.stopped ? 'stopped' : inFlight ? 'in_flight' : r.busy ? 'busy' : r.cold || age === null || age >= config.ttlMinutes * 60 ? 'cold' : r.roundBumps >= config.maxBumps ? 'round_limit' : r.contextTokens < config.minContextTokens ? 'small_context' : age >= config.idleMinutes * 60 ? 'due' : 'waiting'
+    const ttl = routeTtlMs(r) / 1000
+    const state = r.manualOff ? 'manual_off' : !active() ? sessionOff ? 'session_off' : globallyOff ? 'global_off' : 'session_ended'
+      : proxy.serverKeepalive ? 'server_keepalive'
+      : r.stopped ? 'stopped' : inFlight ? 'in_flight' : r.busy ? 'busy'
+      : r.cacheTtl === '5m' && ttl <= config.idleMinutes * 60 ? 'short_ttl'
+      : r.cold || age === null || age >= ttl ? 'cold' : r.roundBumps >= config.maxBumps ? 'round_limit'
+      : r.contextTokens < config.minContextTokens ? 'small_context' : age >= config.idleMinutes * 60 ? 'due' : 'waiting'
     const eligible = state === 'due' || state === 'waiting'
     return {
       agent_id: r.id, label: r.label, model: r.model || 'unknown', agent_type: r.agentType || host?.type || 'unknown',
       host_status: r.id === MAIN ? r.busy ? 'running' : 'idle' : host?.status || (hostError ? 'unknown' : 'not_listed'),
       keepwarm_enabled: !r.manualOff, manual_off: r.manualOff, effective_state: state, eligible, in_flight: inFlight,
-      context_tokens: r.contextTokens, bumps: r.bumps, round_bumps: r.roundBumps, max_bumps: config.maxBumps,
+      cache_ttl: r.cacheTtl || 'unknown',
+      context_tokens: r.contextTokens, bumps: r.bumps, round_bumps: r.roundBumps, server_bumps: r.serverTotal, server_round_bumps: r.serverCount, max_bumps: config.maxBumps,
       cache_age_seconds: age, next_bump_at: eligible ? Math.ceil((r.requestAt + config.idleMinutes * 60_000) / 1000) : 0,
-      reason: r.manualOff ? '手动关闭保活' : r.reason,
+      reason: r.manualOff ? '手动关闭保活' : state === 'short_ttl' ? SHORT_TTL_REASON : r.reason,
     }
   })
   return { ok: saved, ...(saved ? {} : { error: 'state_write_failed', message: '开关仅在当前进程中生效，保存失败；重载前请重新设置并确认。' }), session_id: logSessionId, plugin_enabled: active(), work_paused: active() && quota.blocked, interval_minutes: config.idleMinutes, max_bumps: config.maxBumps, ...(hostError ? { host_status_error: hostError } : {}), targets }
 }
 
-const controlText = (result: any): string => {
-  const lines = [result.ok ? `保活查询；空闲${result.interval_minutes}分钟，每路每轮最多${result.max_bumps}次。` : result.message]
-  const states: Record<string, string> = { manual_off: '手动关闭', plugin_paused: '整个插件已暂停', plugin_off: '整个插件已关闭', session_ended: '会话已结束', stopped: '已停止', in_flight: '已有保活在途', busy: '工作中', cold: '等待正常工作建立缓存', round_limit: '达到本轮上限', small_context: '上下文较小', due: '已到保活时间', waiting: '等待保活时间' }
-  for (const r of result.targets ?? []) lines.push(`${r.label} (${r.agent_id})：保活${r.keepwarm_enabled ? '开启' : '手动关闭'}；${states[r.effective_state]}；宿主${r.host_status}；模型${r.model}；累计${r.bumps}，本轮${r.round_bumps}/${r.max_bumps}${r.in_flight ? '；已经发出的请求会继续结束' : ''}`)
+const STATE_TEXT: Record<string, string> = { server_keepalive: '由代理保活', manual_off: '手动关闭保活', session_off: '随当前会话关闭', global_off: '随全局关闭', session_ended: '会话已结束', stopped: '已停止', in_flight: '正在保活', busy: '工作中', short_ttl: SHORT_TTL_REASON, cold: '等待正常工作建立缓存', round_limit: '达到本轮上限', small_context: '上下文较小', due: '已到保活时间', waiting: '等待保活时间' }
+const TTL_TEXT: Record<string, string> = { '5m': '5分钟', '1h': '1小时', unknown: '未知' }
+
+// /keepwarm、status 与单目标开关共用同一行格式。
+const targetLine = (t: any, now: number): string => {
+  const detail = t.effective_state === 'waiting' ? `${Math.max(0, Math.ceil((t.next_bump_at * 1000 - now) / 60_000))} 分钟后保活`
+    : ['stopped', 'cold'].includes(t.effective_state) && t.reason ? t.reason : STATE_TEXT[t.effective_state]
+  return `${t.label}${t.agent_id === MAIN ? '' : ` (${t.agent_id})`}：${detail}${t.in_flight && t.effective_state !== 'in_flight' ? '，已经发出的请求会继续结束' : ''}；累计 ${t.bumps + t.server_bumps}，本轮 ${t.round_bumps + t.server_round_bumps}/${t.max_bumps}${t.server_bumps ? `（代理保活 ${t.server_bumps}）` : ''}；缓存有效期 ${TTL_TEXT[t.cache_ttl]}；宿主 ${t.host_status}；模型 ${t.model}`
+}
+
+const controlText = (result: any, now: number): string =>
+  [...(result.ok ? [] : [result.message]), ...(result.targets ?? []).map((t: any) => targetLine(t, now))].join('\n')
+
+const status = async ($: any): Promise<string> => {
+  const result = await control($, 'status')
+  if (!result.targets) return result.message
+  const now = await $.clock.now()
+  const serverTotal = [...routes.values()].reduce((sum, r) => sum + r.serverTotal, 0)
+  const lines = [
+    active() ? `插件已开启；空闲 ${config.idleMinutes} 分钟后保活，每路每轮最多 ${config.maxBumps} 次。`
+      : `${globallyOff ? '插件已全局关闭（删除 ~/.claude/keepwarm-off 后恢复）' : '插件在当前会话已关闭（/keepwarm on 重新开启）'}；保活、额度拦截、自动继续均停用。`,
+    proxyActive()
+      ? `最近5小时额度：${quota.usedPercent ?? '--'}%；到线后由代理迁移或给出恢复时间，本地不暂停；待继续 ${deferredWork.size} 路${proxyResumeAt ? `，${new Date(proxyResumeAt).toLocaleTimeString()} 恢复后自动继续` : ''}。`
+      : `最近5小时额度：${quota.usedPercent ?? '--'}% / 停线 ${config.quotaStopPercent}%；普通工作${active() && quota.blocked ? '已暂停，重置后自动继续' : '可继续'}；待继续 ${deferredWork.size} 路。`,
+    proxy.supported
+      ? `代理智能路由：${proxy.mode === 'active' ? '生效' : '影子（路由仍按旧规则）'}；服务端保活${proxy.serverKeepalive ? '已开启，插件不再发保活' : '未开启'}${proxy.vmId ? `；本对话在账号 ${proxy.vmId}` : ''}${proxy.rushUntil > now ? `；加急至 ${new Date(proxy.rushUntil).toLocaleTimeString()}` : ''}。`
+      : '代理智能路由：未检测到，沿用本地保活和额度保护。',
+    `保活累计 ${[...routes.values()].reduce((sum, r) => sum + r.bumps + r.serverTotal, 0)}，本轮 ${roundBumps === null ? '-' : roundBumps + (routes.get(MAIN)?.serverCount ?? 0)}（自主对话最近一次正常恢复起）${serverTotal ? `；其中代理服务端保活累计 ${serverTotal}` : ''}。`,
+    `日志：${logPath || '不可用'}${logError ? `（${logError}）` : ''}`,
+    ...result.targets.map((t: any) => targetLine(t, now)),
+  ]
+  if (result.host_status_error) lines.push(result.host_status_error)
+  lines.push(await wakeCommand($, 'status'))
   return lines.join('\n')
 }
 
-const status = async ($: any): Promise<string> => {
-  const now = await $.clock.now()
-  const lines = [active() ? `插件已开启；空闲 ${config.idleMinutes} 分钟，每路最多 ${config.maxBumps} 次。` : `插件${paused ? '已暂停' : '已全局关闭'}；保活、额度拦截、自动继续均停用。`, `最近5小时额度：${quota.usedPercent ?? '--'}% / 停线 ${config.quotaStopPercent}%；普通工作${active() && quota.blocked ? '已暂停，重置后自动继续' : '可继续'}；待继续 ${deferredWork.size} 路。`]
-  lines.push(`保活累计 ${[...routes.values()].reduce((sum, r) => sum + r.bumps, 0)}，本轮 ${roundBumps ?? '-'}（自主对话最近一次正常恢复起）。`)
-  lines.push(`日志：${logPath || '不可用'}${logError ? `（${logError}）` : ''}`)
-  for (const r of routes.values()) {
-    const left = Math.max(0, Math.ceil((r.requestAt + config.idleMinutes * 60_000 - now) / 60_000))
-    const state = r.manualOff ? '手动关闭保活' : !active() ? '随插件停用' : r.stopped ? r.reason : r.pending ? '正在保活' : r.busy ? '工作中' : r.cold ? (r.reason || '等待正常对话') : `${left} 分钟后保活`
-    lines.push(`${r.label}${r.id === MAIN ? '' : ` (${r.id})`}：累计 ${r.bumps}，本轮 ${r.roundBumps}/${config.maxBumps}，${state}`)
+// 手动迁移和加急交给代理执行：迁移在本对话的下一次请求生效。
+const proxyCommand = async ($: any, action: 'migrate' | 'rush', arg?: string): Promise<string> => {
+  await refreshProxy($, true)
+  if (!proxy.supported) return '当前连接的代理不支持智能路由，或智能路由已关闭。'
+  if (action === 'rush') {
+    const mode = (arg ?? 'on').toLowerCase()
+    if (!['on', 'off'].includes(mode)) return USAGE
+    const reply = await callProxy($, 'rush', { on: mode === 'on' })
+    if (!reply.ok) return reply.code === 'session_not_found' ? '代理还没有本对话的记录，先发一次正常请求。' : `加急设置失败：${reply.message || reply.code}`
+    proxy.rushUntil = Number(reply.data?.rush_until) || 0
+    await audit($, 'proxy_rush', { enabled: mode === 'on' })
+    await publish($)
+    return mode === 'on' ? `已开启加急，至 ${new Date(proxy.rushUntil).toLocaleTimeString()}：原账号被限制时不等待，直接迁移到装得下的账号。${proxy.mode === 'active' ? '' : '代理当前是影子模式，加急要到智能路由生效后才起作用。'}` : '已关闭加急。'
   }
-  lines.push(await wakeCommand($, 'status'))
-  return lines.join('\n')
+  if (arg !== undefined && !/^[a-zA-Z0-9_-]{1,128}$/.test(arg)) return '账号请填写面板里的账号标识或槽位标识。'
+  const reply = await callProxy($, 'migrate', { target: arg ?? '' })
+  if (!reply.ok) return reply.code === 'session_not_found' ? '代理还没有本对话的记录，先发一次正常请求。' : `迁移登记失败：${reply.message || reply.code}`
+  await audit($, 'proxy_migrate', { target: arg ?? '' })
+  const cost = Number(reply.data?.rebuild_usd)
+  return `已登记迁移：本对话的下一次请求换到${arg ? `账号 ${arg}` : '余量最多的其他账号'}${Number.isFinite(cost) ? `，预计重建成本 ${cost.toFixed(2)} 美元` : ''}。指令在 ${new Date(Number(reply.data?.expires_at) || 0).toLocaleTimeString()} 前有效，目标不可用时不执行。${proxy.mode === 'active' ? '' : '代理当前是影子模式，迁移指令要到智能路由生效后才执行。'}`
 }
 
 // 只识别已确认属于本插件保活回合的通知；混合普通任务通知时全部放行。
@@ -635,6 +891,8 @@ export const register: Register = (on) => {
     if (!switching) { timer?.cancel(); timer = null }
     for (const r of routes.values()) if (r.pending) { r.pending.abortReason = 'session_end'; r.blocked = r.pending; r.pending = null }
     if (ttlOverridden && await $.env.get('CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL') === '1h') await $.env.set('CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL', oldSubagentTtl)
+    // 真正退出时告诉代理本对话和它的子代理不用再保活。
+    if (!switching && proxy.supported) await callProxy($, 'end', { scope: 'family' })
     await audit($, 'session_ended', { reason: e.reason, ending_session_id: e.sessionId })
     await publish($)
     return next(e)
@@ -644,10 +902,15 @@ export const register: Register = (on) => {
     const generation = sessionGeneration
     await syncEnablement($)
     const result = await next(e)
-    if (generation !== sessionGeneration || ended) return result
-    if (result.agentId && supported(e.subagentType) && routes.size <= MAX_AGENTS && !routes.has(result.agentId)) routes.set(result.agentId, newRoute(result.agentId, e.description || result.agentId))
-    if (result.agentId && routes.has(result.agentId)) routes.get(result.agentId)!.peerName = result.teammateId?.split('@')[0] ?? e.name ?? routes.get(result.agentId)!.peerName
-    if (result.agentId && routes.has(result.agentId)) { const r = routes.get(result.agentId)!; r.model = result.model || r.model; r.agentType = e.subagentType }
+    const id = result.agentId
+    if (!id || generation !== sessionGeneration || ended) return result
+    const name = result.teammateId?.split('@')[0] ?? e.name
+    const view = rememberAgent(id, e.description, e.subagentType, name, 'running')
+    if (name) view.name = name
+    if (supported(e.subagentType) && routes.size <= MAX_AGENTS && !routes.has(id)) routes.set(id, newRoute(id, e.description || id))
+    const r = routes.get(id)
+    if (r) { r.peerName = name ?? r.peerName; r.model = result.model || r.model; r.agentType = e.subagentType }
+    await publish($)
     return result
   })
   on('session.receive', async ($, e, next) => {
@@ -660,16 +923,23 @@ export const register: Register = (on) => {
   })
   on('turn.start', async ($, e, next) => {
     if (!await ensureSession($, !e.agentId)) return next(e)
+    const generation = sessionGeneration
     const enabled = await syncEnablement($)
     const r = await findRoute($, e.agentId)
+    if (generation !== sessionGeneration || ended) return next(e)
+    const own = !!r?.pending && isPingTurn(e.text, r.pending)
+    const late = !!r?.blocked && isPingTurn(e.text, r.blocked)
+    const view = e.agentId ? agentViews.get(e.agentId) : undefined
+    if (view && !own && !late) {
+      view.phase = 'running'; view.workTurnId = e.turnId; view.completedRound = null
+    }
     if (r) {
       // 超时后才到达的旧保活消息不能重新启动任务或发送模型请求。
-      if (enabled && r.blocked && isPingTurn(e.text, r.blocked)) {
+      if (enabled && late && r.blocked) {
         await audit($, 'ping_late_rejected', { agent_id: r.id, marker: r.blocked.marker, turn_id: e.turnId })
         r.blocked.turnId = e.turnId; r.busy = true; r.turnId = e.turnId
         return next(e)
       }
-      const own = !!r.pending && isPingTurn(e.text, r.pending)
       if (own) {
         r.pending!.turnId = e.turnId
         await audit($, 'ping_received', { agent_id: r.id, marker: r.pending!.marker, turn_id: e.turnId, format: pingFormat(e.text, r.pending!) })
@@ -678,8 +948,8 @@ export const register: Register = (on) => {
         r.pending = null; notices.delete(r.id); deferredWork.delete(r.id)
       }
       r.busy = true; r.turnId = e.turnId
-      await publish($)
     }
+    if (r || view) await publish($)
     return next(e)
   })
   on('turn.step', async function* ($, e, next) {
@@ -726,8 +996,10 @@ export const register: Register = (on) => {
     return next(e)
   })
   on('turn.complete', async ($, e, next) => {
+    const generation = sessionGeneration
     if (ended || await $.session.id() !== logSessionId) return next(e)
     const r = await findRoute($, e.agentId)
+    if (generation !== sessionGeneration || ended) return next(e)
     // 普通子代理由本插件恢复时，宿主跳过本插件的start/step，但完成事件仍会送达。
     // 只接受该代理本次唯一标记的精确回复，直接使用宿主完成事件中的真实用量。
     if (r?.pending && !r.pending.turnId && e.answer.trim() === r.pending.marker) {
@@ -738,6 +1010,16 @@ export const register: Register = (on) => {
     if (r?.busy && r.turnId !== e.turnId) return next(e)
     if (r?.blocked?.turnId === e.turnId) { r.busy = false; r.blocked = null; await publish($); return next(e) }
     const pending = r?.pending?.turnId === e.turnId ? r.pending : null
+    const view = e.agentId ? agentViews.get(e.agentId) : undefined
+    // 保活的完成事件只计数。保留真实任务终态，并忽略旧轮迟到的完成事件。
+    const late = r?.blocked?.marker === e.answer.trim()
+    const workTurnId = view?.workTurnId
+    const stale = workTurnId && (view?.phase === 'running' ? workTurnId !== e.turnId : workTurnId === e.turnId)
+    if (view && !stale && !pending && !late) {
+      view.phase = e.isAborted || e.reason !== 'answer' ? 'closed' : deferredWork.has(view.id) ? 'waiting' : 'completed'
+      view.completedRound = view.phase === 'completed' ? conversationRound : null
+      view.workTurnId = e.turnId
+    }
     if (r) {
       r.busy = false
       if (pending) {
@@ -748,8 +1030,9 @@ export const register: Register = (on) => {
         if (pending.toolDenied) await stopRoute($, r, '保活回合尝试工具，已拦截')
         else if (e.isAborted && !pending.abortReason) { deferredWork.delete(r.id); await stopRoute($, r, '用户取消') }
       } else if (e.isAborted) { deferredWork.delete(r.id); await stopRoute($, r, '用户取消') }
-      await publish($)
+      else if (e.reason === 'error' && active() && proxyActive()) void checkParked($, r).catch(error => note($, `代理状态查询异常：${String(error)}`))
     }
+    if (r || view) await publish($)
     return next(e)
   })
   on('session.compact', async ($, e, next) => {
@@ -761,26 +1044,37 @@ export const register: Register = (on) => {
   on('prompt.submit', async ($, e, next) => {
     if (!await ensureSession($)) return next(e)
     if (await syncEnablement($) && isOwnNotice(e)) { await audit($, 'ping_notice_filtered', { phase: 'submit' }); return { drop: 'keepwarm 已记录子代理保活结果' } }
+    // 自动完成通知也会唤起主对话，但仍属于用户发起的同一轮。
+    if (!e.isMeta && ['composer', 'bridge', 'sdk'].includes(e.origin?.kind)) {
+      conversationRound += 1
+      await publish($)
+    }
+    return next(e)
+  })
+  on('classic.Stop', async ($, e, next) => {
+    if (!e.agent_id && e.session_id === logSessionId) await rememberTranscript($, routes.get(MAIN), e.transcript_path)
+    return next(e)
+  })
+  on('classic.SubagentStop', async ($, e, next) => {
+    if (e.session_id === logSessionId) await rememberTranscript($, routes.get(e.agent_id), e.agent_transcript_path)
     return next(e)
   })
   on('command.run', { command: 'keepwarm' }, async ($, e) => {
     await ensureSession($, true)
     const raw = e.args.trim()
-    const [action, target, ...extra] = raw.split(/\s+/)
-    const verb = action.toLowerCase()
-    if (['off', 'on', 'status'].includes(verb)) {
-      if (extra.length) return { text: '用法：/keepwarm off|on|status [准确代理标识或main]' }
-      const result = await control($, verb, target)
-      return { text: controlText(result) + (verb === 'status' && !target && result.ok ? `\n${await wakeCommand($, 'status')}` : '') }
+    const [first, target, ...extra] = raw.split(/\s+/)
+    const action = first.toLowerCase()
+    if (action === 'wake') return { text: await wakeCommand($, raw.slice(first.length).trim().toLowerCase()) }
+    if (action === 'migrate' || action === 'rush') return { text: extra.length ? USAGE : await proxyCommand($, action, target) }
+    if (!['', 'status', 'off', 'on'].includes(action) || extra.length) return { text: USAGE }
+    // 带目标时只查询或开关该路；不带目标的 off/on 关闭或开启当前会话整个插件。
+    if (target !== undefined) return { text: controlText(await control($, action, target), await $.clock.now()) }
+    if (action === 'off' || action === 'on') {
+      sessionOff = action === 'off'
+      if (await syncEnablement($)) await updateQuota($)
+      await audit($, sessionOff ? 'session_off' : 'session_on')
+      await publish($)
     }
-    if (verb === 'wake') return { text: await wakeCommand($, raw.slice(action.length).trim().toLowerCase()) }
-    if (target) return { text: '用法：/keepwarm [off|on|status [代理标识]|pause|resume|wake [HH:MM|off|status]]' }
-    if (verb === 'pause') paused = true
-    else if (verb === 'resume') paused = false
-    else if (verb !== '' && verb !== 'status') return { text: '用法：/keepwarm [pause|resume|status|wake [HH:MM|off|status]]' }
-    if (await syncEnablement($) && verb === 'resume') await updateQuota($)
-    if (verb === 'pause' || verb === 'resume') await audit($, verb === 'pause' ? 'plugin_paused' : 'plugin_resumed')
-    await publish($)
     return { text: await status($) }
   })
 }

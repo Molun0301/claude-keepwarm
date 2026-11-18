@@ -102,6 +102,8 @@ function createScheduler({ home = os.homedir(), env = process.env, execute = exe
         CLAUDE_CODE_MAX_OUTPUT_TOKENS: '512', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' }
       delete childEnv.CLAUDECODE
       if (backend) {
+        // 用户配置已读入子进程环境；避免客户端再次加载并覆盖本次固定路由的认证和请求头。
+        args.push('--setting-sources', '')
         childEnv.ANTHROPIC_BASE_URL = backend.baseUrl
         childEnv.ANTHROPIC_AUTH_TOKEN = discovery.apiKey
         childEnv.ANTHROPIC_API_KEY = discovery.apiKey

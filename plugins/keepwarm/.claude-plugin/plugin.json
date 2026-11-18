@@ -1,7 +1,7 @@
 {
   "name": "keepwarm",
-  "description": "主会话与子代理独立保活开关、查询；会话切换恢复；90%额度保护；多账户独立每日唤醒。",
-  "version": "0.10.0",
+  "description": "主会话与子代理独立保活开关、查询；按实际缓存有效期调度；会话切换恢复；90%额度保护；多账户独立每日唤醒。",
+  "version": "0.12.2",
   "author": {
     "name": "Gabriel (delitefully)",
     "email": "git@delite.dev"
